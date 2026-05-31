@@ -100,7 +100,7 @@
         android:layout_width="0dp"
         android:layout_height="0dp"
         android:scrollbars="horizontal|vertical"
-        app:layout_constraintBottom_toTopOf="@+id/btn_export_history"
+        app:layout_constraintBottom_toTopOf="@+id/layout_export_actions"
         app:layout_constraintEnd_toEndOf="parent"
         app:layout_constraintStart_toStartOf="parent"
         app:layout_constraintTop_toBottomOf="@+id/card_history_header">
@@ -125,19 +125,43 @@
         </LinearLayout>
     </HorizontalScrollView>
 
-    <!-- Export Action Button -->
-    <com.google.android.material.button.MaterialButton
-        android:id="@+id/btn_export_history"
+    <!-- Export Action Button Container -->
+    <LinearLayout
+        android:id="@+id/layout_export_actions"
         android:layout_width="0dp"
-        android:layout_height="56dp"
-        android:layout_margin="16dp"
-        android:text="EXPORT MY CSV REPORT"
-        android:textStyle="bold"
-        app:cornerRadius="8dp"
-        app:icon="@android:drawable/ic_menu_save"
+        android:layout_height="wrap_content"
+        android:orientation="horizontal"
+        android:padding="16dp"
         app:layout_constraintBottom_toBottomOf="parent"
         app:layout_constraintEnd_toEndOf="parent"
-        app:layout_constraintStart_toStartOf="parent" />
+        app:layout_constraintStart_toStartOf="parent">
+
+        <!-- CSV Export Button -->
+        <com.google.android.material.button.MaterialButton
+            android:id="@+id/btn_export_history"
+            style="@style/Widget.MaterialComponents.Button.Icon"
+            android:layout_width="0dp"
+            android:layout_height="56dp"
+            android:layout_weight="1"
+            android:layout_marginEnd="8dp"
+            android:text="EXPORT CSV"
+            android:textStyle="bold"
+            app:cornerRadius="8dp"
+            app:icon="@drawable/csv_24px" />
+
+        <!-- PDF Export Button -->
+        <com.google.android.material.button.MaterialButton
+            android:id="@+id/btn_export_pdf_history"
+            style="@style/Widget.MaterialComponents.Button.Icon"
+            android:layout_width="0dp"
+            android:layout_height="56dp"
+            android:layout_weight="1"
+            android:layout_marginStart="8dp"
+            android:text="EXPORT PDF"
+            android:textStyle="bold"
+            app:cornerRadius="8dp"
+            app:icon="@drawable/picture_as_pdf_24px" />
+    </LinearLayout>
 
     <!-- Loading UI -->
     <ProgressBar
