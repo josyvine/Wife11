@@ -63,7 +63,7 @@ public class TimeUtils {
      * Logic: Checks if the current time has passed the start time plus a grace period.
      * @param targetTime The shift start time.
      * @param graceMinutes Minutes allowed before being considered "Late".
-     * @return true if current time is beyond the grace period.
+     * @return true if current time is beyond or exactly at the grace period.
      */
     public static boolean isPastGracePeriod(String targetTime, int graceMinutes) {
         if (targetTime == null || targetTime.isEmpty() || targetTime.equals("N/A")) return false;
@@ -75,8 +75,8 @@ public class TimeUtils {
             if (now != null && target != null) {
                 long diffMillis = now.getTime() - target.getTime();
                 long diffMinutes = TimeUnit.MILLISECONDS.toMinutes(diffMillis);
-                // Return true only if we are significantly late (past grace period)
-                return diffMinutes > graceMinutes;
+                // Return true if we are exactly at or past the maximum allowed grace limit [3]
+                return diffMinutes >= graceMinutes;
             }
         } catch (ParseException e) {
             Log.e(TAG, "isPastGracePeriod error", e);
