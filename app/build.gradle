@@ -25,7 +25,7 @@ android {
       storeFile file(keystorePath)
       storePassword System.getenv("KEYSTORE_PASSWORD")
       keyAlias = System.getenv("KEY_ALIAS") ?: "trade"
-      keyPassword System.getenv("KEY_PASSWORD")
+      keyPassword = System.getenv("KEY_PASSWORD")
     }
     create("debugConfig") {
       storeFile file("${rootDir}/debug.keystore")
@@ -37,7 +37,7 @@ android {
 
   buildTypes {
     release {
-      isCrunchPngs = false
+      crunchPngs = false
       minifyEnabled false
       proguardFiles getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro"
       signingConfig signingConfigs.release
