@@ -96,6 +96,13 @@ public class PatternPromptBuilder {
         sb.append("\n=== STRICT TWO-TIERED HYBRID SYSTEM INSTRUCTIONS ===\n");
         sb.append("You are acting as the AI Cognitive Layer of a Two-Tiered Hybrid Chart Pattern Detection System.\n\n");
         
+        sb.append("=== CONVERSATIONAL STATE & VERBAL ANNOUNCEMENT GATES ===\n");
+        sb.append("You must follow these strict verbal announcement steps to guide the user through your assessment:\n");
+        sb.append("1. When starting your evaluation, you must first output the verbal statement: 'Chart pattern engine is analyzing for chart pattern.' to declare the analytical phase.\n");
+        sb.append("2. If performing Protocol 1 (Validator Turn) and the mathematical pattern is valid, you must state 'Found' and generate the updated JSON payload via function tool.\n");
+        sb.append("3. If performing Protocol 2 (Cognitive Fallback Turn) where the candidate is empty '{}', you must first output the verbal statement: 'Not found any pattern.' to the user.\n");
+        sb.append("4. Immediately after stating 'Not found any pattern', explain your visual transition to the hybrid scanner, identify any tradeable 'messy' visual setups from the raw logs, and call your drawing tools to render them.\n\n");
+
         sb.append("=== PROTOCOL 1: THE MATHEMATICAL VALIDATOR TURN ===\n");
         sb.append("If the local mathematical candidate is NOT empty (meaning patternGeometry coordinates are provided):\n");
         sb.append("- Act strictly as an Advisory Validator.\n");
