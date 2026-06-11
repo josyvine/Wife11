@@ -93,10 +93,31 @@ public class PatternPromptBuilder {
                 i, c.open, c.high, c.low, c.close, c.volume, c.timestamp));
         }
 
-        sb.append("\n=== STRICT VALIDATION & EXPLANATION INSTRUCTIONS ===\n");
-        sb.append("You are acting strictly as an Advisory Validator. However, if the local pattern geometry coordinates are empty '{}', you must perform a cognitive fallback scan over the raw candlestick list to identify any visual pattern setups.\n");
-        sb.append("Analyze the provided local mathematical pattern candidate, verify its technical symmetry using the OHLCV data, and evaluate volume/indicator alignment.\n");
-        sb.append("You must populate the 'timestamp' field for each coordinate Point inside your 'points' array by matching the indices directly to the provided candlestick list timestamps. This prevents drawing drift.\n");
+        sb.append("\n=== STRICT TWO-TIERED HYBRID SYSTEM INSTRUCTIONS ===\n");
+        sb.append("You are acting as the AI Cognitive Layer of a Two-Tiered Hybrid Chart Pattern Detection System.\n\n");
+        
+        sb.append("=== PROTOCOL 1: THE MATHEMATICAL VALIDATOR TURN ===\n");
+        sb.append("If the local mathematical candidate is NOT empty (meaning patternGeometry coordinates are provided):\n");
+        sb.append("- Act strictly as an Advisory Validator.\n");
+        sb.append("- Verify the technical symmetry of the proposed pattern against the candlestick table.\n");
+        sb.append("- Evaluate the indicators setup (RSI, Bollinger Bands, EMAs) and volume breakout expansion.\n");
+        sb.append("- Provide minor confidence score adjustments (+/- 5% max) or visual state updates inside your output JSON.\n\n");
+
+        sb.append("=== PROTOCOL 2: THE COGNITIVE HYBRID FALLBACK TURN ===\n");
+        sb.append("If the local mathematical candidate is EMPTY '{}':\n");
+        sb.append("- You must immediately transition into your Primary Cognitive Scanner role.\n");
+        sb.append("- Programmatic scanner found no pattern candidates due to rigid mathematical thresholds (e.g. a minor wick overshooting a boundary).\n");
+        sb.append("- Perform an active fallback scan over the raw candlestick list to identify any visual pattern setups (e.g. Double Bottoms, Head and Shoulders, Triangles, Flags, Wedges) that are technically tradeable but slightly 'messy'.\n");
+        sb.append("- Do not miss valid patterns simply because they have minor geometric deviations.\n\n");
+
+        sb.append("=== STABILIZATION & COORDINATE SNAPPING (CRITICAL FOR ACCURACY) ===\n");
+        sb.append("To prevent visual drawing drift, flickering, or line fluctuation on the chart canvas:\n");
+        sb.append("1. DO NOT under any circumstances hallucinate, invent, or estimate coordinates, index positions, or price levels.\n");
+        sb.append("2. Locate the exact candlesticks in the chronological market series where the pivot highs (peaks) and pivot lows (valleys) occurred.\n");
+        sb.append("3. Extract the exact 'index', 'price' (candle high for peaks, candle low for valleys), and unique 'timestamp' values directly from those table rows.\n");
+        sb.append("4. Construct your output 'points' and 'necklinePoints' arrays using these exact matched values. Every point MUST contain its correct timestamp.\n\n");
+
+        sb.append("=== STRUCTURED OUTPUT FORMAT ===\n");
         sb.append("Return your final validated assessment as a JSON payload prefixed exactly with 'PATTERN: '.\n");
         sb.append("The JSON schema MUST conform to the updated ChartPatternResponse structure, containing: \n");
         sb.append("1. An updated copy of the 'patterns' array incorporating any micro-adjustments to the validation explanation and fully populated 'timestamp' fields.\n");
