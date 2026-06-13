@@ -2,6 +2,8 @@ package com.wife.app;
 
 import android.content.Context;
 import android.net.wifi.p2p.WifiP2pInfo;
+import android.os.Handler;
+import android.os.Looper;
 import android.util.Log;
 
 import java.io.IOException;
@@ -129,8 +131,14 @@ public class ConnectionManager implements WiFiDirectManager.ConnectionChangeList
     }
 
     private void notifyStateChanged() {
-        for (ConnectionStatusListener listener : statusListeners) {
-            listener.onConnectionStateChanged(isConnected, peerIpAddress, isHost);
-        }
+        new Handler(Looper.getMainLooper()).post(() -> {
+            List<ConnectionStatusListener> targets;
+            synchronized (ConnectionManager.this) {
+                targets = new ArrayList<>(statusListeners);
+            }
+            for (ConnectionStatusListener listener : targets) {
+                listener.onConnectionStateChanged(isConnected, peerIpAddress, isHost);
+            }
+        });
     }
 }
