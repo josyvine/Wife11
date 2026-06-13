@@ -46,31 +46,37 @@ public class MessageSender {
         final String messageId = UUID.randomUUID().toString();
         final long timestamp = System.currentTimeMillis();
 
-        // 1. Save locally to Database
-        MessageEntity entity = new MessageEntity(selfId, "peer_device", text, timestamp);
-        RoomDatabaseManager.getInstance(context).messageDao().insert(entity);
-
-        // 2. Transmit to Peer
+        // Save locally to Database and Transmit to Peer in the background executor thread
         executorService.execute(() -> {
-            try (Socket socket = new Socket(peerIp, Constants.OFF_PORT_TEXT);
-                 OutputStream os = socket.getOutputStream();
-                 PrintWriter pw = new PrintWriter(os, true)) {
+            try {
+                // 1. Save locally to Database safely on background thread
+                MessageEntity entity = new MessageEntity(selfId, "peer_device", text, timestamp);
+                RoomDatabaseManager.getInstance(context).messageDao().insert(entity);
 
-                JsonObject json = new JsonObject();
-                json.addProperty("type", "message");
-                json.addProperty("id", messageId);
-                json.addProperty("sender", selfId);
-                json.addProperty("time", timestamp);
-                json.addProperty("text", text);
+                // 2. Transmit to Peer
+                try (Socket socket = new Socket(peerIp, Constants.OFF_PORT_TEXT);
+                     OutputStream os = socket.getOutputStream();
+                     PrintWriter pw = new PrintWriter(os, true)) {
 
-                pw.println(json.toString());
-                Log.d(TAG, "Sent message packet to " + peerIp + ": " + text);
-                
-                // Mirror back to active ChatActivity
-                ChatManager.getInstance(context).notifyMessageReceived(entity);
+                    JsonObject json = new JsonObject();
+                    json.addProperty("type", "message");
+                    json.addProperty("id", messageId);
+                    json.addProperty("sender", selfId);
+                    json.addProperty("time", timestamp);
+                    json.addProperty("text", text);
 
-            } catch (Exception e) {
-                Log.e(TAG, "Failed sending message to " + peerIp + ": " + e.getMessage());
+                    pw.println(json.toString());
+                    Log.d(TAG, "Sent message packet to " + peerIp + ": " + text);
+                    
+                    // Mirror back to active ChatActivity
+                    ChatManager.getInstance(context).notifyMessageReceived(entity);
+
+                } catch (Exception e) {
+                    Log.e(TAG, "Failed sending socket packet to " + peerIp + ": " + e.getMessage());
+                }
+
+            } catch (Exception dbException) {
+                Log.e(TAG, "Failed saving message locally: " + dbException.getMessage());
             }
         });
     }
