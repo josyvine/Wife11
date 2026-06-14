@@ -95,7 +95,7 @@ public class ChatActivity extends AppCompatActivity implements ChatManager.Messa
     public void onMessageReceived(MessageEntity message) {
         runOnUiThread(() -> {
             messagesList.add(message);
-            adapter.notifyItemInserted(messagesList.size() - 1);
+            adapter.notifyDataSetChanged();
             scrollToBottom();
         });
     }
