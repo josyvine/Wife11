@@ -164,6 +164,7 @@ public class VideoCaptureManager {
     private byte[] convertYuvToJpeg(ImageProxy image) {
         int width = image.getWidth();
         int height = image.getHeight();
+        int rotationDegrees = image.getImageInfo().getRotationDegrees();
 
         ImageProxy.PlaneProxy[] planes = image.getPlanes();
         ByteBuffer yBuffer = planes[0].getBuffer();
@@ -214,14 +215,42 @@ public class VideoCaptureManager {
             }
         }
 
+        byte[] jpegBytes;
         try (ByteArrayOutputStream out = new ByteArrayOutputStream()) {
             YuvImage yuvImage = new YuvImage(nv21, ImageFormat.NV21, width, height, null);
             yuvImage.compressToJpeg(new Rect(0, 0, width, height), 70, out);
-            return out.toByteArray();
+            jpegBytes = out.toByteArray();
         } catch (Exception e) {
             Log.e(TAG, "Nv21 compression to JPEG failed: " + e.getMessage());
             WifeLogger.log(TAG, "Stride-aware conversion NV21-to-JPEG compression failed: " + e.getMessage(), e);
             return null;
         }
+
+        // Rotate the compressed JPEG bytes natively if target rotation is non-zero
+        if (rotationDegrees != 0 && jpegBytes != null) {
+            try {
+                Bitmap rawBitmap = BitmapFactory.decodeByteArray(jpegBytes, 0, jpegBytes.length);
+                if (rawBitmap != null) {
+                    android.graphics.Matrix matrix = new android.graphics.Matrix();
+                    matrix.postRotate(rotationDegrees);
+                    Bitmap rotatedBitmap = Bitmap.createBitmap(rawBitmap, 0, 0, rawBitmap.getWidth(), rawBitmap.getHeight(), matrix, true);
+                    
+                    if (rotatedBitmap != rawBitmap) {
+                        rawBitmap.recycle();
+                    }
+                    
+                    try (ByteArrayOutputStream rotatedOut = new ByteArrayOutputStream()) {
+                        rotatedBitmap.compress(Bitmap.CompressFormat.JPEG, 70, rotatedOut);
+                        byte[] rotatedBytes = rotatedOut.toByteArray();
+                        rotatedBitmap.recycle();
+                        return rotatedBytes;
+                    }
+                }
+            } catch (Exception rotateEx) {
+                WifeLogger.log(TAG, "Failed to natively rotate camera stream bytes: " + rotateEx.getMessage(), rotateEx);
+            }
+        }
+
+        return jpegBytes;
     }
 }
