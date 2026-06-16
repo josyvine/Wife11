@@ -1,5 +1,7 @@
 package com.wife.app;
 
+import android.content.Intent;
+import android.content.SharedPreferences;
 import android.os.Bundle;
 import android.text.TextUtils;
 import android.view.View;
@@ -103,6 +105,15 @@ public class ChatActivity extends AppCompatActivity implements ChatManager.Messa
         super.onResume();
         WifeLogger.log("ChatActivity", "onResume() invoked. Registering ChatActivity observer to ChatManager listener list.");
         ChatManager.getInstance(this).registerMessageListener(this);
+
+        // Clear unread notification counts and save state to clear the unread badge
+        try {
+            SharedPreferences prefs = getSharedPreferences("WifeSettings", MODE_PRIVATE);
+            prefs.edit().putInt("unread_count", 0).apply();
+            WifeLogger.log("ChatActivity", "Unread chat message count reset to 0 inside local preferences.");
+        } catch (Exception e) {
+            WifeLogger.log("ChatActivity", "Error resetting unread message counts: " + e.getMessage(), e);
+        }
     }
 
     @Override
