@@ -1,6 +1,7 @@
 package com.wife.app;
 
 import android.content.Context;
+import android.content.SharedPreferences;
 import android.util.Log;
 
 import com.google.gson.JsonObject;
@@ -68,10 +69,14 @@ public class MessageSender {
 
                     WifeLogger.log(TAG, "Socket connection established successfully with " + peerIp + " on port " + Constants.OFF_PORT_TEXT);
 
+                    SharedPreferences prefs = context.getSharedPreferences("WifeSettings", Context.MODE_PRIVATE);
+                    String customName = prefs.getString("custom_alias", Utils.getDeviceModel());
+
                     JsonObject json = new JsonObject();
                     json.addProperty("type", "message");
                     json.addProperty("id", messageId);
                     json.addProperty("sender", selfId);
+                    json.addProperty("senderName", customName);
                     json.addProperty("time", timestamp);
                     json.addProperty("text", text);
 
