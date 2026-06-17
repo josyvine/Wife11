@@ -100,7 +100,6 @@ public class MessageReceiver implements Runnable {
         if ("handshake".equals(valType)) {
             Log.d(TAG, "Handshake received, client ip updated.");
             WifeLogger.log(TAG, "Control event matched: 'handshake'. Handshake payload processed successfully.");
-            // ConnectionManager.getInstance(context).updatePeerIpFromAccept(peerIp); // Redundant now as it is executed on method entry
         }
 
         // Check for Unsend/Global Delete Signal
@@ -195,9 +194,29 @@ public class MessageReceiver implements Runnable {
                     PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE
             );
 
+            // Clean up structured payload labels for notification body
+            String displayMessage = messageText;
+            if (messageText.startsWith("[FILE]:")) {
+                String payload = messageText.substring(7);
+                String[] parts = payload.split("\\|");
+                displayMessage = "📁 Document: " + (parts.length > 0 ? parts[0] : "File");
+            } else if (messageText.startsWith("[IMAGE]:")) {
+                String payload = messageText.substring(8);
+                String[] parts = payload.split("\\|");
+                displayMessage = "📷 Image: " + (parts.length > 0 ? parts[0] : "Photo");
+            } else if (messageText.startsWith("[VIDEO]:")) {
+                String payload = messageText.substring(8);
+                String[] parts = payload.split("\\|");
+                displayMessage = "🎥 Video: " + (parts.length > 0 ? parts[0] : "Movie");
+            } else if (messageText.startsWith("[AUDIO]:")) {
+                String payload = messageText.substring(8);
+                String[] parts = payload.split("\\|");
+                displayMessage = "🎤 Voice Note: " + (parts.length > 0 ? parts[0] : "Audio");
+            }
+
             NotificationCompat.Builder builder = new NotificationCompat.Builder(context, channelId)
                     .setContentTitle(senderName)
-                    .setContentText(messageText)
+                    .setContentText(displayMessage)
                     .setSmallIcon(android.R.drawable.stat_notify_chat)
                     .setPriority(NotificationCompat.PRIORITY_HIGH)
                     .setContentIntent(pendingIntent)
