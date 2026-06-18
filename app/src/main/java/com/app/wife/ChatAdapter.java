@@ -17,6 +17,7 @@ import android.view.View;
 import android.view.ViewGroup;
 import android.widget.ImageView;
 import android.widget.PopupMenu;
+import android.widget.SeekBar;
 import android.widget.TextView;
 import android.widget.Toast;
 
@@ -41,7 +42,11 @@ public class ChatAdapter extends RecyclerView.Adapter<RecyclerView.ViewHolder> {
     // Inline Audio Playback variables
     private MediaPlayer mediaPlayer;
     private String currentlyPlayingPath;
-    private TextView currentlyPlayingTextView;
+    private int activePlayingPosition = -1;
+
+    // Handler loop to update the seekbar position dynamically
+    private final Handler progressHandler = new Handler(Looper.getMainLooper());
+    private Runnable progressRunnable;
 
     public ChatAdapter(Context context, List<MessageEntity> messages) {
         this.messages = messages;
@@ -117,17 +122,35 @@ public class ChatAdapter extends RecyclerView.Adapter<RecyclerView.ViewHolder> {
             if (isAttachment) {
                 h.itemView.setOnClickListener(null); // Clear previous item click
                 
-                // Show standard preview block and clear text
+                // Show standard preview blocks or dynamic WhatsApp inline controller layout
                 if (rawText.startsWith("[FILE]:") && !isVisualImage) {
+                    h.tvText.setVisibility(View.VISIBLE);
                     h.tvText.setText("📁 Document: " + labelWithFileSize);
+                    h.layoutAudioPlayer.setVisibility(View.GONE);
                 } else if (isVisualImage) {
-                    h.tvText.setText("📷 Image: " + labelWithFileSize);
+                    h.tvText.setVisibility(View.GONE); // Hide raw label name on chat bubble for professional look
+                    h.layoutAudioPlayer.setVisibility(View.GONE);
                 } else if (isVisualVideo) {
-                    h.tvText.setText("🎥 Video: " + labelWithFileSize);
+                    h.tvText.setVisibility(View.GONE); // Hide raw label name on chat bubble for professional look
+                    h.layoutAudioPlayer.setVisibility(View.GONE);
                 } else if (rawText.startsWith("[AUDIO]:")) {
-                    h.tvText.setText("🎤 Voice Note: " + labelWithFileSize);
-                    h.tvText.setTag("🎤 Voice Note: " + labelWithFileSize);
-                    h.itemView.setOnClickListener(v -> playAudio(v.getContext(), localFile, h.tvText, labelWithFileSize));
+                    h.tvText.setVisibility(View.GONE); // Hide description completely
+                    h.layoutAudioPlayer.setVisibility(View.VISIBLE); // Show interactive layout block
+                    
+                    // Direct dynamic binding to keep playing state across scroll recyclings
+                    if (localFile.getAbsolutePath().equals(currentlyPlayingPath)) {
+                        h.btnAudioPlayPause.setImageResource(mediaPlayer != null && mediaPlayer.isPlaying() ? R.drawable.pause_24px : R.drawable.play_arrow_24px);
+                        h.audioSeekBar.setMax(mediaPlayer != null ? mediaPlayer.getDuration() : 100);
+                        h.audioSeekBar.setProgress(mediaPlayer != null ? mediaPlayer.getCurrentPosition() : 0);
+                        h.tvAudioProgress.setText(formatDuration(mediaPlayer != null ? mediaPlayer.getCurrentPosition() : 0));
+                        startProgressUpdate(h.audioSeekBar, h.tvAudioProgress);
+                    } else {
+                        h.btnAudioPlayPause.setImageResource(R.drawable.play_arrow_24px);
+                        h.audioSeekBar.setProgress(0);
+                        h.tvAudioProgress.setText("00:00");
+                    }
+
+                    h.btnAudioPlayPause.setOnClickListener(v -> playAudio(v.getContext(), localFile, position, h.btnAudioPlayPause, h.audioSeekBar, h.tvAudioProgress));
                 }
 
                 // Render dynamic memory-safe image/video thumbnail card using native generator
@@ -152,7 +175,9 @@ public class ChatAdapter extends RecyclerView.Adapter<RecyclerView.ViewHolder> {
                     }
                 }
             } else {
+                h.tvText.setVisibility(View.VISIBLE);
                 h.tvText.setText(rawText);
+                h.layoutAudioPlayer.setVisibility(View.GONE);
                 if (h.ivImage != null) {
                     h.ivImage.setVisibility(View.GONE);
                 }
@@ -167,15 +192,33 @@ public class ChatAdapter extends RecyclerView.Adapter<RecyclerView.ViewHolder> {
                 h.ivSave.setOnClickListener(v -> saveReceivedFileToPublic(v.getContext(), finalFilename));
 
                 if (rawText.startsWith("[FILE]:") && !isVisualImage) {
+                    h.tvText.setVisibility(View.VISIBLE);
                     h.tvText.setText("📁 Document: " + labelWithFileSize);
+                    h.layoutAudioPlayer.setVisibility(View.GONE);
                 } else if (isVisualImage) {
-                    h.tvText.setText("📷 Image: " + labelWithFileSize);
+                    h.tvText.setVisibility(View.GONE); // Hide raw label name on chat bubble for professional look
+                    h.layoutAudioPlayer.setVisibility(View.GONE);
                 } else if (isVisualVideo) {
-                    h.tvText.setText("🎥 Video: " + labelWithFileSize);
+                    h.tvText.setVisibility(View.GONE); // Hide raw label name on chat bubble for professional look
+                    h.layoutAudioPlayer.setVisibility(View.GONE);
                 } else if (rawText.startsWith("[AUDIO]:")) {
-                    h.tvText.setText("🎤 Voice Note: " + labelWithFileSize);
-                    h.tvText.setTag("🎤 Voice Note: " + labelWithFileSize);
-                    h.itemView.setOnClickListener(v -> playAudio(v.getContext(), localFile, h.tvText, labelWithFileSize));
+                    h.tvText.setVisibility(View.GONE); // Hide description completely
+                    h.layoutAudioPlayer.setVisibility(View.VISIBLE); // Show interactive layout block
+                    
+                    // Direct dynamic binding to keep playing state across scroll recyclings
+                    if (localFile.getAbsolutePath().equals(currentlyPlayingPath)) {
+                        h.btnAudioPlayPause.setImageResource(mediaPlayer != null && mediaPlayer.isPlaying() ? R.drawable.pause_24px : R.drawable.play_arrow_24px);
+                        h.audioSeekBar.setMax(mediaPlayer != null ? mediaPlayer.getDuration() : 100);
+                        h.audioSeekBar.setProgress(mediaPlayer != null ? mediaPlayer.getCurrentPosition() : 0);
+                        h.tvAudioProgress.setText(formatDuration(mediaPlayer != null ? mediaPlayer.getCurrentPosition() : 0));
+                        startProgressUpdate(h.audioSeekBar, h.tvAudioProgress);
+                    } else {
+                        h.btnAudioPlayPause.setImageResource(R.drawable.play_arrow_24px);
+                        h.audioSeekBar.setProgress(0);
+                        h.tvAudioProgress.setText("00:00");
+                    }
+
+                    h.btnAudioPlayPause.setOnClickListener(v -> playAudio(v.getContext(), localFile, position, h.btnAudioPlayPause, h.audioSeekBar, h.tvAudioProgress));
                 }
 
                 // Render dynamic memory-safe image/video thumbnail card using native generator
@@ -201,7 +244,9 @@ public class ChatAdapter extends RecyclerView.Adapter<RecyclerView.ViewHolder> {
                 }
             } else {
                 h.ivSave.setVisibility(View.GONE);
+                h.tvText.setVisibility(View.VISIBLE);
                 h.tvText.setText(rawText);
+                h.layoutAudioPlayer.setVisibility(View.GONE);
                 if (h.ivImage != null) {
                     h.ivImage.setVisibility(View.GONE);
                 }
@@ -347,26 +392,61 @@ public class ChatAdapter extends RecyclerView.Adapter<RecyclerView.ViewHolder> {
         }
     }
 
-    private void playAudio(Context context, File audioFile, TextView statusView, String originalLabel) {
-        if (mediaPlayer != null) {
-            stopAudio();
-            if (currentlyPlayingPath != null && currentlyPlayingPath.equals(audioFile.getAbsolutePath())) {
-                return; // Re-tapping active playing file cancels playback cleanly
+    private void playAudio(Context context, File audioFile, int position, final ImageView btnPlayPause, final SeekBar seekBar, final TextView tvProgress) {
+        if (mediaPlayer != null && currentlyPlayingPath != null && currentlyPlayingPath.equals(audioFile.getAbsolutePath())) {
+            // Toggling action on the active playing note
+            if (mediaPlayer.isPlaying()) {
+                mediaPlayer.pause();
+                btnPlayPause.setImageResource(R.drawable.play_arrow_24px);
+                stopProgressUpdate();
+            } else {
+                mediaPlayer.start();
+                btnPlayPause.setImageResource(R.drawable.pause_24px);
+                startProgressUpdate(seekBar, tvProgress);
             }
+            return;
         }
+
+        stopAudio();
 
         try {
             mediaPlayer = new MediaPlayer();
             mediaPlayer.setDataSource(audioFile.getAbsolutePath());
             mediaPlayer.prepare();
-            mediaPlayer.setOnCompletionListener(mp -> stopAudio());
+            mediaPlayer.setOnCompletionListener(mp -> {
+                stopAudio();
+                notifyItemChanged(position);
+            });
+
+            seekBar.setMax(mediaPlayer.getDuration());
+            seekBar.setProgress(0);
+
             mediaPlayer.start();
-            
             currentlyPlayingPath = audioFile.getAbsolutePath();
-            currentlyPlayingTextView = statusView;
-            statusView.setText("🔊 Playing... " + originalLabel);
-            
+            activePlayingPosition = position;
+
+            btnPlayPause.setImageResource(R.drawable.pause_24px);
+
+            // Drag navigation seek bar listener
+            seekBar.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
+                @Override
+                public void onProgressChanged(SeekBar seekBar, int progress, boolean fromUser) {
+                    if (fromUser && mediaPlayer != null && currentlyPlayingPath != null && currentlyPlayingPath.equals(audioFile.getAbsolutePath())) {
+                        mediaPlayer.seekTo(progress);
+                        tvProgress.setText(formatDuration(progress));
+                    }
+                }
+
+                @Override
+                public void onStartTrackingTouch(SeekBar seekBar) {}
+
+                @Override
+                public void onStopTrackingTouch(SeekBar seekBar) {}
+            });
+
+            startProgressUpdate(seekBar, tvProgress);
             Toast.makeText(context, "Playing audio note...", Toast.LENGTH_SHORT).show();
+
         } catch (Exception e) {
             WifeLogger.log("ChatAdapter", "Failed playing audio voice note: " + e.getMessage());
             Toast.makeText(context, "Playback failed.", Toast.LENGTH_SHORT).show();
@@ -374,6 +454,7 @@ public class ChatAdapter extends RecyclerView.Adapter<RecyclerView.ViewHolder> {
     }
 
     private void stopAudio() {
+        stopProgressUpdate();
         if (mediaPlayer != null) {
             try {
                 if (mediaPlayer.isPlaying()) {
@@ -383,11 +464,49 @@ public class ChatAdapter extends RecyclerView.Adapter<RecyclerView.ViewHolder> {
             } catch (Exception ignored) {}
             mediaPlayer = null;
         }
-        if (currentlyPlayingTextView != null) {
-            currentlyPlayingTextView.setText(currentlyPlayingTextView.getTag() != null ? currentlyPlayingTextView.getTag().toString() : "🎤 Voice Note");
-            currentlyPlayingTextView = null;
-        }
+
+        int prevPos = activePlayingPosition;
         currentlyPlayingPath = null;
+        activePlayingPosition = -1;
+
+        if (prevPos != -1) {
+            notifyItemChanged(prevPos);
+        }
+    }
+
+    private void startProgressUpdate(final SeekBar seekBar, final TextView tvProgress) {
+        stopProgressUpdate();
+        progressRunnable = new Runnable() {
+            @Override
+            public void run() {
+                if (mediaPlayer != null && currentlyPlayingPath != null) {
+                    try {
+                        int current = mediaPlayer.getCurrentPosition();
+                        seekBar.setProgress(current);
+                        tvProgress.setText(formatDuration(current));
+                        progressHandler.postDelayed(this, 100);
+                    } catch (Exception e) {
+                        stopProgressUpdate();
+                    }
+                } else {
+                    stopProgressUpdate();
+                }
+            }
+        };
+        progressHandler.post(progressRunnable);
+    }
+
+    private void stopProgressUpdate() {
+        if (progressRunnable != null) {
+            progressHandler.removeCallbacks(progressRunnable);
+            progressRunnable = null;
+        }
+    }
+
+    private String formatDuration(long milliseconds) {
+        long seconds = (milliseconds / 1000) % 60;
+        long minutes = (milliseconds / (1000 * 60)) % 60;
+        return String.format(Locale.getDefault(), "%02d:%02d", minutes, seconds);
     }
 
     private void viewImage(Context context, File imageFile, String filename) {
@@ -399,7 +518,7 @@ public class ChatAdapter extends RecyclerView.Adapter<RecyclerView.ViewHolder> {
             );
             Intent intent = new Intent(Intent.ACTION_VIEW);
 
-            // Sniff file extension to dynamically resolve matching MIME type (Fixes Glitch 5)
+            // Sniff file extension to dynamically resolve matching MIME type
             String mimeType = "image/*";
             String ext = "";
             int idx = filename.lastIndexOf('.');
@@ -602,12 +721,20 @@ public class ChatAdapter extends RecyclerView.Adapter<RecyclerView.ViewHolder> {
         TextView tvText;
         TextView tvTime;
         ImageView ivImage; // Dynamic square photo/video preview block
+        View layoutAudioPlayer;
+        ImageView btnAudioPlayPause;
+        SeekBar audioSeekBar;
+        TextView tvAudioProgress;
 
         public SentViewHolder(@NonNull View itemView) {
             super(itemView);
             tvText = itemView.findViewById(R.id.tvMessageText);
             tvTime = itemView.findViewById(R.id.tvMessageTime);
             ivImage = itemView.findViewById(R.id.ivMessageImage);
+            layoutAudioPlayer = itemView.findViewById(R.id.layoutAudioPlayer);
+            btnAudioPlayPause = itemView.findViewById(R.id.btnAudioPlayPause);
+            audioSeekBar = itemView.findViewById(R.id.audioSeekBar);
+            tvAudioProgress = itemView.findViewById(R.id.tvAudioProgress);
         }
     }
 
@@ -616,6 +743,10 @@ public class ChatAdapter extends RecyclerView.Adapter<RecyclerView.ViewHolder> {
         TextView tvTime;
         ImageView ivSave; // Tiny save icon for received files
         ImageView ivImage; // Dynamic square photo/video preview block
+        View layoutAudioPlayer;
+        ImageView btnAudioPlayPause;
+        SeekBar audioSeekBar;
+        TextView tvAudioProgress;
 
         public ReceivedViewHolder(@NonNull View itemView) {
             super(itemView);
@@ -623,6 +754,10 @@ public class ChatAdapter extends RecyclerView.Adapter<RecyclerView.ViewHolder> {
             tvTime = itemView.findViewById(R.id.tvMessageTime);
             ivSave = itemView.findViewById(R.id.ivSaveAttachment);
             ivImage = itemView.findViewById(R.id.ivMessageImage);
+            layoutAudioPlayer = itemView.findViewById(R.id.layoutAudioPlayer);
+            btnAudioPlayPause = itemView.findViewById(R.id.btnAudioPlayPause);
+            audioSeekBar = itemView.findViewById(R.id.audioSeekBar);
+            tvAudioProgress = itemView.findViewById(R.id.tvAudioProgress);
         }
     }
 }
