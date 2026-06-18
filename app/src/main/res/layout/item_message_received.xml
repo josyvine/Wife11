@@ -40,6 +40,51 @@
                     android:visibility="gone"
                     android:contentDescription="Received media preview" />
 
+                <!-- WhatsApp-Style Inline Audio Playback Bar -->
+                <LinearLayout
+                    android:id="@+id/layoutAudioPlayer"
+                    android:layout_width="240dp"
+                    android:layout_height="wrap_content"
+                    android:orientation="horizontal"
+                    android:gravity="center_vertical"
+                    android:layout_marginBottom="6dp"
+                    android:visibility="gone">
+
+                    <!-- Play/Pause State Toggle -->
+                    <ImageView
+                        android:id="@+id/btnAudioPlayPause"
+                        android:layout_width="36dp"
+                        android:layout_height="36dp"
+                        android:padding="6dp"
+                        android:scaleType="fitCenter"
+                        android:src="@android:drawable/ic_media_play"
+                        app:tint="#333333"
+                        android:contentDescription="Play/Pause audio" />
+
+                    <!-- Playback Timeline Tracker -->
+                    <SeekBar
+                        android:id="@+id/audioSeekBar"
+                        android:layout_width="0dp"
+                        android:layout_height="wrap_content"
+                        android:layout_weight="1"
+                        android:max="100"
+                        android:progress="0"
+                        android:thumbTint="@color/editorial_accent"
+                        android:progressTint="@color/editorial_accent"
+                        android:progressBackgroundTint="#77006495" />
+
+                    <!-- Current / Duration Progress Output -->
+                    <TextView
+                        android:id="@+id/tvAudioProgress"
+                        android:layout_width="wrap_content"
+                        android:layout_height="wrap_content"
+                        android:layout_marginStart="4dp"
+                        android:text="00:00"
+                        android:textColor="#888888"
+                        android:textSize="11sp" />
+
+                </LinearLayout>
+
                 <TextView
                     android:id="@+id/tvMessageText"
                     android:layout_width="wrap_content"
