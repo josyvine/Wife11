@@ -95,7 +95,7 @@ public class FileReceiver implements Runnable {
                 while (serverChannel.isOpen()) {
                     clientChannel = serverChannel.accept();
                     clientChannel.configureBlocking(true);
-                    
+
                     String clientIp = clientChannel.socket().getInetAddress().getHostAddress();
                     WifeLogger.log(TAG, "Accepted persistent transfer stream connection from: " + clientIp);
 
@@ -129,11 +129,28 @@ public class FileReceiver implements Runnable {
         int fileIndex = 0;
 
         while (!FileTransferForegroundService.isCancelled && socketChannel.isConnected()) {
-            // 1. Read the 4-byte metadata length header
-            ByteBuffer lenBuf = ByteBuffer.allocate(4);
+            // 1. Read the 4-byte metadata length header directly from proxyIn
+            byte[] lenBytes = new byte[4];
             int bytesRead = 0;
             while (bytesRead < 4 && !FileTransferForegroundService.isCancelled) {
-                int read = socketChannel.read(lenBuf);
+                // Symmetrical Thread-Safe Pause/Resume wait monitor locks
+                synchronized (FileTransferForegroundService.pauseLock) {
+                    while (FileTransferForegroundService.isPaused && !FileTransferForegroundService.isCancelled) {
+                        try {
+                            WifeLogger.log(TAG, "Receiver thread entering wait state due to active pause command.");
+                            FileTransferForegroundService.pauseLock.wait();
+                        } catch (InterruptedException e) {
+                            WifeLogger.log(TAG, "Receiver pause monitor thread interrupted.");
+                            Thread.currentThread().interrupt();
+                        }
+                    }
+                }
+
+                if (FileTransferForegroundService.isCancelled) {
+                    break;
+                }
+
+                int read = proxyIn.read(lenBytes, bytesRead, 4 - bytesRead);
                 if (read == -1) {
                     WifeLogger.log(TAG, "Stream ended abruptly while reading metadata length.");
                     return;
@@ -145,8 +162,11 @@ public class FileReceiver implements Runnable {
                 break;
             }
 
-            lenBuf.flip();
-            int metadataLength = lenBuf.getInt();
+            // Decode big-endian integer length
+            int metadataLength = ((lenBytes[0] & 0xFF) << 24) |
+                                 ((lenBytes[1] & 0xFF) << 16) |
+                                 ((lenBytes[2] & 0xFF) << 8)  |
+                                 (lenBytes[3] & 0xFF);
 
             // 0 metadata length indicates the persistent queue transfer session has completed naturally
             if (metadataLength == 0) {
@@ -155,11 +175,28 @@ public class FileReceiver implements Runnable {
                 break;
             }
 
-            // 2. Read exactly the serialized JSON metadata payload
-            ByteBuffer metaBuf = ByteBuffer.allocate(metadataLength);
+            // 2. Read exactly the serialized JSON metadata payload directly from proxyIn
+            byte[] metaBytes = new byte[metadataLength];
             bytesRead = 0;
             while (bytesRead < metadataLength && !FileTransferForegroundService.isCancelled) {
-                int read = socketChannel.read(metaBuf);
+                // Symmetrical Thread-Safe Pause/Resume wait monitor locks
+                synchronized (FileTransferForegroundService.pauseLock) {
+                    while (FileTransferForegroundService.isPaused && !FileTransferForegroundService.isCancelled) {
+                        try {
+                            WifeLogger.log(TAG, "Receiver thread entering wait state due to active pause command.");
+                            FileTransferForegroundService.pauseLock.wait();
+                        } catch (InterruptedException e) {
+                            WifeLogger.log(TAG, "Receiver pause monitor thread interrupted.");
+                            Thread.currentThread().interrupt();
+                        }
+                    }
+                }
+
+                if (FileTransferForegroundService.isCancelled) {
+                    break;
+                }
+
+                int read = proxyIn.read(metaBytes, bytesRead, metadataLength - bytesRead);
                 if (read == -1) {
                     throw new IOException("Stream ended abruptly while reading metadata payload.");
                 }
@@ -170,8 +207,7 @@ public class FileReceiver implements Runnable {
                 break;
             }
 
-            metaBuf.flip();
-            String metaJson = StandardCharsets.UTF_8.decode(metaBuf).toString();
+            String metaJson = new String(metaBytes, StandardCharsets.UTF_8);
             JsonObject meta = JsonParser.parseString(metaJson).getAsJsonObject();
 
             final String filename = meta.get("name").getAsString();
