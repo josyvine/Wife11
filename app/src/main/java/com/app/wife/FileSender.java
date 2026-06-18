@@ -76,7 +76,7 @@ public class FileSender {
 
         // Trigger the queue execution under the active service lifecycle
         WifeLogger.log(TAG, "Legacy sendFile() invoked. Wrapping in single-item queue list.");
-        
+
         Intent serviceIntent = new Intent(context, FileTransferForegroundService.class);
         serviceIntent.setAction(Constants.ACTION_START_TRANSFER);
         serviceIntent.putExtra("IS_SENDER", true);
@@ -104,7 +104,7 @@ public class FileSender {
                 socketChannel = SocketChannel.open();
                 socketChannel.connect(new InetSocketAddress(peerIp, Constants.OFF_PORT_FILE));
                 socketChannel.configureBlocking(true);
-                
+
                 socketOs = socketChannel.socket().getOutputStream();
                 WifeLogger.log(TAG, "SocketChannel persistent connection established successfully.");
 
@@ -134,7 +134,7 @@ public class FileSender {
                         fileMeta.addProperty("lastPosition", FileTransferForegroundService.lastPosition);
 
                         byte[] metaBytes = fileMeta.toString().getBytes(StandardCharsets.UTF_8);
-                        
+
                         // Write 4-byte length header prefix
                         ByteBuffer lenBuf = ByteBuffer.allocate(4);
                         lenBuf.putInt(metaBytes.length);
@@ -146,15 +146,17 @@ public class FileSender {
                         // Write raw JSON block
                         ByteBuffer metaBuf = ByteBuffer.wrap(metaBytes);
                         while (metaBuf.hasRemaining()) {
-                            socketChannel.write(metadataBuffer(metaBytes));
+                            socketChannel.write(metaBuf);
                         }
 
                         Log.d(TAG, "JSON Handshake payload sent: " + fileMeta.toString());
 
                         // 4. Wrap Socket Channel output stream into the fast LZ4 compressor stream
-                        // Note: We use .finish() instead of .close() inside the file transitions 
-                        // to keep the underlying SocketChannel open and persistent!
-                        LZ4FrameOutputStream lz4Out = CompressionUtils.wrapOutputStream(socketOs);
+                        // Note: We wrap the stream using our custom NonClosingOutputStream so that
+                        // calling lz4Out.close() correctly flushes and terminates the compression frame,
+                        // without closing the underlying persistent SocketChannel connection!
+                        OutputStream nonClosingOs = new NonClosingOutputStream(socketOs);
+                        LZ4FrameOutputStream lz4Out = CompressionUtils.wrapOutputStream(nonClosingOs);
 
                         // Position channel if resuming from a crash/partial state
                         if (FileTransferForegroundService.lastPosition > 0) {
@@ -207,17 +209,17 @@ public class FileSender {
                             }
                         }
 
-                        // Finalize this LZ4 compressed file block segment without closing the socket!
-                        lz4Out.flush();
-                        lz4Out.finish();
+                        // Flush and close the LZ4 frame stream.
+                        // Our custom NonClosingOutputStream protects the persistent SocketChannel below.
+                        lz4Out.close();
 
                         if (!FileTransferForegroundService.isCancelled) {
                             WifeLogger.log(TAG, "File successfully streamed: " + fileName);
-                            
+
                             // Insert database transfer record
                             FileEntity entity = new FileEntity(fileName, fileSize, fileUri.toString(), System.currentTimeMillis());
                             RoomDatabaseManager.getInstance(context).fileDao().insert(entity);
-                            
+
                             // Reset file resume position tracking for next queue file
                             FileTransferForegroundService.lastPosition = 0;
                             broadcastProgress(fileName, fileSize, fileSize, 100, i);
@@ -247,7 +249,7 @@ public class FileSender {
                         socketChannel.close();
                     }
                 } catch (IOException ignored) {}
-                
+
                 // Stop foreground service context cleanly
                 Intent stopIntent = new Intent(context, FileTransferForegroundService.class);
                 context.stopService(stopIntent);
@@ -284,5 +286,35 @@ public class FileSender {
         Intent intent = new Intent(Constants.ACTION_TRANSFER_ERROR);
         intent.putExtra(Constants.EXTRA_ERROR_MESSAGE, message);
         LocalBroadcastManager.getInstance(context).sendBroadcast(intent);
+    }
+
+    // --- Symmetrical Non-Closing Socket Stream Wrapper ---
+    private static class NonClosingOutputStream extends OutputStream {
+        private final OutputStream delegate;
+
+        public NonClosingOutputStream(OutputStream delegate) {
+            this.delegate = delegate;
+        }
+
+        @Override
+        public void write(int b) throws IOException {
+            delegate.write(b);
+        }
+
+        @Override
+        public void write(byte[] b, int off, int len) throws IOException {
+            delegate.write(b, off, len);
+        }
+
+        @Override
+        public void flush() throws IOException {
+            delegate.flush();
+        }
+
+        @Override
+        public void close() throws IOException {
+            // Intercept close() request to preserve the underlying persistent SocketChannel
+            Log.d(TAG, "Intercepted close() request. Stream remains open.");
+        }
     }
 }
