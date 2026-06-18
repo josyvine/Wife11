@@ -25,6 +25,7 @@ import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
+import java.util.Locale;
 import java.util.UUID;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -179,6 +180,11 @@ public class FileSender {
                             long totalBytesSent = FileTransferForegroundService.lastPosition;
                             long lastNotificationUpdateTime = System.currentTimeMillis();
 
+                            // Rolling calculation variables for live transfer speed
+                            long speedPeriodBytesSent = 0;
+                            long speedPeriodStartTime = System.currentTimeMillis();
+                            double currentSpeed = 0.0; // in MB/s
+
                             while (!FileTransferForegroundService.isCancelled) {
                                 // Symmetrical Thread-Safe Pause/Resume wait monitor locks
                                 synchronized (FileTransferForegroundService.pauseLock) {
@@ -208,13 +214,22 @@ public class FileSender {
                                 // Write raw compressed block straight to output stream
                                 socketOs.write(byteBuffer.array(), 0, readBytes);
                                 totalBytesSent += readBytes;
+                                speedPeriodBytesSent += readBytes;
                                 FileTransferForegroundService.lastPosition = totalBytesSent;
 
-                                // Regularly throttle status broadcasts to prevent UI thread choke
                                 long currentTime = System.currentTimeMillis();
+                                long timeDiff = currentTime - speedPeriodStartTime;
+                                if (timeDiff >= 1000) {
+                                    // Speed (MB/s) = (Bytes / 1MB) / (timeDiff / 1s)
+                                    currentSpeed = ((double) speedPeriodBytesSent / (1024.0 * 1024.0)) / ((double) timeDiff / 1000.0);
+                                    speedPeriodBytesSent = 0;
+                                    speedPeriodStartTime = currentTime;
+                                }
+
+                                // Regularly throttle status broadcasts to prevent UI thread choke
                                 if (currentTime - lastNotificationUpdateTime >= 500) {
                                     int percent = (int) ((totalBytesSent * 100) / compressedSize);
-                                    broadcastProgress(fileName, totalBytesSent, compressedSize, percent, i);
+                                    broadcastProgress(fileName, totalBytesSent, compressedSize, percent, i, currentSpeed);
                                     lastNotificationUpdateTime = currentTime;
                                 }
                             }
@@ -229,7 +244,7 @@ public class FileSender {
 
                             // Reset file resume position tracking for next queue file
                             FileTransferForegroundService.lastPosition = 0;
-                            broadcastProgress(fileName, compressedSize, compressedSize, 100, i);
+                            broadcastProgress(fileName, compressedSize, compressedSize, 100, i, 0.0);
                         }
                     } finally {
                         // Symmetrical Cleanup: Always purge local temporary files
@@ -270,18 +285,20 @@ public class FileSender {
         return ByteBuffer.wrap(metaBytes);
     }
 
-    private void broadcastProgress(String fileName, long transferred, long total, int percent, int fileIndex) {
+    private void broadcastProgress(String fileName, long transferred, long total, int percent, int fileIndex, double speed) {
         Intent intent = new Intent(Constants.ACTION_TRANSFER_PROGRESS);
         intent.putExtra(Constants.EXTRA_FILE_NAME, fileName);
         intent.putExtra(Constants.EXTRA_BYTES_TRANSFERRED, transferred);
         intent.putExtra(Constants.EXTRA_TOTAL_BYTES, total);
         intent.putExtra(Constants.EXTRA_FILE_INDEX, fileIndex);
+        intent.putExtra(Constants.EXTRA_TRANSFER_SPEED, speed);
         LocalBroadcastManager.getInstance(context).sendBroadcast(intent);
 
-        // Update foreground service notification in parallel
+        // Update foreground service notification in parallel with formatted transfer rate metrics
+        String speedText = String.format(Locale.US, "%.1f MB/s", speed);
         Intent serviceIntent = new Intent(context, FileTransferForegroundService.class);
         serviceIntent.setAction("UPDATE_NOTIF");
-        serviceIntent.putExtra("NOTIF_TEXT", "Sending " + fileName + " (" + percent + "%)");
+        serviceIntent.putExtra("NOTIF_TEXT", "Sending " + fileName + " (" + percent + "%) - " + speedText);
         serviceIntent.putExtra("PROGRESS", percent);
         context.startService(serviceIntent);
     }
