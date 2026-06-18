@@ -56,14 +56,15 @@ public final class CompressionUtils {
         if (in == null || out == null) {
             throw new IllegalArgumentException("Streams cannot be null.");
         }
-        try (LZ4FrameOutputStream lz4Out = new LZ4FrameOutputStream(out)) {
-            byte[] buffer = new byte[8192];
-            int bytesRead;
-            while ((bytesRead = in.read(buffer)) != -1) {
-                lz4Out.write(buffer, 0, bytesRead);
-            }
-            lz4Out.flush();
+        LZ4FrameOutputStream lz4Out = new LZ4FrameOutputStream(out);
+        byte[] buffer = new byte[8192];
+        int len;
+        while ((len = in.read(buffer)) > 0) {
+            lz4Out.write(buffer, 0, len);
         }
+        // It is critical to close the LZ4 stream to finalize the frame.
+        // This also closes the underlying 'out' stream.
+        lz4Out.close();
     }
 
     /**
@@ -78,13 +79,13 @@ public final class CompressionUtils {
         if (in == null || out == null) {
             throw new IllegalArgumentException("Streams cannot be null.");
         }
-        try (LZ4FrameInputStream lz4In = new LZ4FrameInputStream(in)) {
-            byte[] buffer = new byte[8192];
-            int bytesRead;
-            while ((bytesRead = lz4In.read(buffer)) != -1) {
-                out.write(buffer, 0, bytesRead);
-            }
-            out.flush();
+        LZ4FrameInputStream lz4In = new LZ4FrameInputStream(in);
+        byte[] buffer = new byte[8192];
+        int len;
+        while ((len = lz4In.read(buffer)) > 0) {
+            out.write(buffer, 0, len);
         }
+        // Closing the wrapper stream is good practice and also closes the underlying 'in' stream.
+        lz4In.close();
     }
 }
