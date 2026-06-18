@@ -11,10 +11,10 @@ import android.util.Log;
 import androidx.localbroadcastmanager.content.LocalBroadcastManager;
 
 import com.google.gson.JsonObject;
-import net.jpountz.lz4.LZ4FrameOutputStream;
 
 import java.io.File;
 import java.io.FileInputStream;
+import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.OutputStream;
 import java.net.InetSocketAddress;
@@ -25,6 +25,7 @@ import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
+import java.util.UUID;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 
@@ -125,16 +126,26 @@ public class FileSender {
 
                     WifeLogger.log(TAG, "Processing file [" + (i + 1) + "/" + uris.size() + "]: " + fileName + " (" + fileSize + " bytes)");
 
-                    // Read local file through file channels
-                    try (ParcelFileDescriptor pfd = context.getContentResolver().openFileDescriptor(fileUri, "r");
-                         FileInputStream fis = new FileInputStream(pfd.getFileDescriptor());
-                         FileChannel fileChannel = fis.getChannel()) {
+                    File tempCompressedFile = new File(context.getCacheDir(), "temp_send_" + UUID.randomUUID().toString() + "_" + fileName + ".lz4");
+
+                    try {
+                        // Compress source file locally to a temp cache file before sending
+                        WifeLogger.log(TAG, "Compressing local file to temporary cache archive.");
+                        try (ParcelFileDescriptor pfd = context.getContentResolver().openFileDescriptor(fileUri, "r");
+                             FileInputStream fis = new FileInputStream(pfd.getFileDescriptor());
+                             FileOutputStream fos = new FileOutputStream(tempCompressedFile)) {
+                            CompressionUtils.compress(fis, fos);
+                        }
+
+                        long compressedSize = tempCompressedFile.length();
+                        WifeLogger.log(TAG, "Compression complete. Compressed Size: " + compressedSize + " bytes.");
 
                         // 3. Serialize and transmit metadata descriptor
                         JsonObject fileMeta = new JsonObject();
                         fileMeta.addProperty("type", "file");
                         fileMeta.addProperty("name", fileName);
                         fileMeta.addProperty("size", fileSize);
+                        fileMeta.addProperty("compressedSize", compressedSize);
                         fileMeta.addProperty("lastPosition", FileTransferForegroundService.lastPosition);
 
                         byte[] metaBytes = fileMeta.toString().getBytes(StandardCharsets.UTF_8);
@@ -153,67 +164,61 @@ public class FileSender {
 
                         Log.d(TAG, "JSON Handshake payload sent directly to stream: " + fileMeta.toString());
 
-                        // 4. Wrap Socket Channel output stream into the fast LZ4 compressor stream
-                        // Note: We wrap the stream using our custom NonClosingOutputStream so that
-                        // calling lz4Out.close() correctly flushes and terminates the compression frame,
-                        // without closing the underlying persistent SocketChannel connection!
-                        OutputStream nonClosingOs = new NonClosingOutputStream(socketOs);
-                        LZ4FrameOutputStream lz4Out = CompressionUtils.wrapOutputStream(nonClosingOs);
+                        // 4. Send raw compressed byte stream over socket directly
+                        try (FileInputStream fisCompressed = new FileInputStream(tempCompressedFile);
+                             FileChannel fileChannel = fisCompressed.getChannel()) {
 
-                        // Position channel if resuming from a crash/partial state
-                        if (FileTransferForegroundService.lastPosition > 0) {
-                            WifeLogger.log(TAG, "Resuming file transfer from offset position: " + FileTransferForegroundService.lastPosition);
-                            fileChannel.position(FileTransferForegroundService.lastPosition);
-                        }
+                            // Position channel if resuming from a crash/partial state
+                            if (FileTransferForegroundService.lastPosition > 0) {
+                                WifeLogger.log(TAG, "Resuming file transfer from offset position: " + FileTransferForegroundService.lastPosition);
+                                fileChannel.position(FileTransferForegroundService.lastPosition);
+                            }
 
-                        // 5. High-Speed 16KB ByteBuffer chunk streaming loop
-                        ByteBuffer byteBuffer = ByteBuffer.allocate(16384);
-                        long totalBytesSent = FileTransferForegroundService.lastPosition;
-                        long lastNotificationUpdateTime = System.currentTimeMillis();
+                            // 5. High-Speed 16KB ByteBuffer chunk streaming loop
+                            ByteBuffer byteBuffer = ByteBuffer.allocate(16384);
+                            long totalBytesSent = FileTransferForegroundService.lastPosition;
+                            long lastNotificationUpdateTime = System.currentTimeMillis();
 
-                        while (!FileTransferForegroundService.isCancelled) {
-                            // Symmetrical Thread-Safe Pause/Resume wait monitor locks
-                            synchronized (FileTransferForegroundService.pauseLock) {
-                                while (FileTransferForegroundService.isPaused && !FileTransferForegroundService.isCancelled) {
-                                    try {
-                                        WifeLogger.log(TAG, "Sender thread entering wait state due to active pause command.");
-                                        FileTransferForegroundService.pauseLock.wait();
-                                    } catch (InterruptedException e) {
-                                        WifeLogger.log(TAG, "Sender pause monitor thread interrupted.");
-                                        Thread.currentThread().interrupt();
+                            while (!FileTransferForegroundService.isCancelled) {
+                                // Symmetrical Thread-Safe Pause/Resume wait monitor locks
+                                synchronized (FileTransferForegroundService.pauseLock) {
+                                    while (FileTransferForegroundService.isPaused && !FileTransferForegroundService.isCancelled) {
+                                        try {
+                                            WifeLogger.log(TAG, "Sender thread entering wait state due to active pause command.");
+                                            FileTransferForegroundService.pauseLock.wait();
+                                        } catch (InterruptedException e) {
+                                            WifeLogger.log(TAG, "Sender pause monitor thread interrupted.");
+                                            Thread.currentThread().interrupt();
+                                        }
                                     }
                                 }
-                            }
 
-                            if (FileTransferForegroundService.isCancelled) {
-                                break;
-                            }
+                                if (FileTransferForegroundService.isCancelled) {
+                                    break;
+                                }
 
-                            byteBuffer.clear();
-                            int readBytes = fileChannel.read(byteBuffer);
-                            if (readBytes == -1) {
-                                WifeLogger.log(TAG, "Reached EOF on local FileChannel.");
-                                break;
-                            }
-                            byteBuffer.flip();
+                                byteBuffer.clear();
+                                int readBytes = fileChannel.read(byteBuffer);
+                                if (readBytes == -1) {
+                                    WifeLogger.log(TAG, "Reached EOF on local FileChannel.");
+                                    break;
+                                }
+                                byteBuffer.flip();
 
-                            // Compress and write chunk on the fly
-                            lz4Out.write(byteBuffer.array(), 0, readBytes);
-                            totalBytesSent += readBytes;
-                            FileTransferForegroundService.lastPosition = totalBytesSent;
+                                // Write raw compressed block straight to output stream
+                                socketOs.write(byteBuffer.array(), 0, readBytes);
+                                totalBytesSent += readBytes;
+                                FileTransferForegroundService.lastPosition = totalBytesSent;
 
-                            // Regularly throttle status broadcasts to prevent UI thread choke
-                            long currentTime = System.currentTimeMillis();
-                            if (currentTime - lastNotificationUpdateTime >= 500) {
-                                int percent = (int) ((totalBytesSent * 100) / fileSize);
-                                broadcastProgress(fileName, totalBytesSent, fileSize, percent, i);
-                                lastNotificationUpdateTime = currentTime;
+                                // Regularly throttle status broadcasts to prevent UI thread choke
+                                long currentTime = System.currentTimeMillis();
+                                if (currentTime - lastNotificationUpdateTime >= 500) {
+                                    int percent = (int) ((totalBytesSent * 100) / compressedSize);
+                                    broadcastProgress(fileName, totalBytesSent, compressedSize, percent, i);
+                                    lastNotificationUpdateTime = currentTime;
+                                }
                             }
                         }
-
-                        // Flush and close the LZ4 frame stream.
-                        // Our custom NonClosingOutputStream protects the persistent SocketChannel below.
-                        lz4Out.close();
 
                         if (!FileTransferForegroundService.isCancelled) {
                             WifeLogger.log(TAG, "File successfully streamed: " + fileName);
@@ -224,7 +229,12 @@ public class FileSender {
 
                             // Reset file resume position tracking for next queue file
                             FileTransferForegroundService.lastPosition = 0;
-                            broadcastProgress(fileName, fileSize, fileSize, 100, i);
+                            broadcastProgress(fileName, compressedSize, compressedSize, 100, i);
+                        }
+                    } finally {
+                        // Symmetrical Cleanup: Always purge local temporary files
+                        if (tempCompressedFile.exists()) {
+                            tempCompressedFile.delete();
                         }
                     }
                 }
