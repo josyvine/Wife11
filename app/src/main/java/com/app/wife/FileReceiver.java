@@ -353,10 +353,6 @@ public class FileReceiver implements Runnable {
                 break;
             case "mp4":
             case "mkv":
-            case "avi":
-            case "mov":
-            case "3gp":
-            case "webm":
                 subFolder = "videos";
                 break;
             case "pdf":
@@ -430,12 +426,20 @@ public class FileReceiver implements Runnable {
     private static void broadcastCompletion(Context context) {
         Intent intent = new Intent(Constants.ACTION_TRANSFER_COMPLETE);
         LocalBroadcastManager.getInstance(context).sendBroadcast(intent);
+
+        // Symmetrical service cleanup to resolve Glitch 3 (Clears Receiver sticky notification)
+        Intent stopIntent = new Intent(context, FileTransferForegroundService.class);
+        context.stopService(stopIntent);
     }
 
     private static void broadcastError(Context context, String message) {
         Intent intent = new Intent(Constants.ACTION_TRANSFER_ERROR);
         intent.putExtra(Constants.EXTRA_ERROR_MESSAGE, message);
         LocalBroadcastManager.getInstance(context).sendBroadcast(intent);
+
+        // Symmetrical service cleanup on error to resolve Glitch 3 (Clears Receiver sticky notification)
+        Intent stopIntent = new Intent(context, FileTransferForegroundService.class);
+        context.stopService(stopIntent);
     }
 
     private static void notifyError(final String error) {
