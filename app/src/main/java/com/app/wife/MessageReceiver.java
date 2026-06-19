@@ -51,6 +51,12 @@ public class MessageReceiver implements Runnable {
                     String type = jsonObject.has("type") ? jsonObject.get("type").getAsString() : "";
                     WifeLogger.log(TAG, "Parsed JSON packet successfully. Resolved type key: " + type);
 
+                    // Extract sender unique ID and update ConnectionManager's active peer device ID to resolve Glitch 2
+                    if (jsonObject.has("sender")) {
+                        String senderId = jsonObject.get("sender").getAsString();
+                        ConnectionManager.getInstance(context).setPeerDeviceId(senderId);
+                    }
+
                     if (isControl) {
                         handleControlMessage(type, jsonObject);
                     } else {
@@ -192,7 +198,7 @@ public class MessageReceiver implements Runnable {
                     0,
                     chatIntent,
                     PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE
-            );
+                );
 
             // Clean up structured payload labels for notification body
             String displayMessage = messageText;
