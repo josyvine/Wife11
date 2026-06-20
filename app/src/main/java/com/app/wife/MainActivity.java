@@ -102,6 +102,17 @@ public class MainActivity extends AppCompatActivity implements ConnectionManager
             }
         });
 
+        // Parallel decoupled 5-way Group Calling Trigger Hook
+        binding.btnGroupCall.setOnClickListener(v -> {
+            if (connectionManager.isConnected()) {
+                WifeLogger.log(TAG, "User launched parallel P2P GroupVideoCallActivity.");
+                Intent groupIntent = new Intent(MainActivity.this, GroupVideoCallActivity.class);
+                startActivity(groupIntent);
+            } else {
+                Toast.makeText(this, "Connect to a nearby device to initiate a Group Call.", Toast.LENGTH_SHORT).show();
+            }
+        });
+
         binding.btnFileShare.setOnClickListener(v -> {
             if (connectionManager.isConnected()) {
                 WifeLogger.log(TAG, "User launched FileTransferActivity.");
