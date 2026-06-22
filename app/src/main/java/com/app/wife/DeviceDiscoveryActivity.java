@@ -175,6 +175,9 @@ public class DeviceDiscoveryActivity extends AppCompatActivity implements
             if (adapter != null) {
                 adapter.notifyDataSetChanged();
             }
+            // Symmetrical Refresh: Automatically initiate a fresh peer scan sweep
+            WifeLogger.log(TAG, "Initiating post-disconnect peer discovery sweep.");
+            wifiDirectManager.discoverPeers();
         }
     }
 }
