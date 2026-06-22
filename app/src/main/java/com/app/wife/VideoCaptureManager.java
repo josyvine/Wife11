@@ -35,6 +35,10 @@ public class VideoCaptureManager {
     private boolean isCapturing = false;
     private int lensFacing = CameraSelector.LENS_FACING_FRONT;
 
+    // Symmetrical Throttling to prevent high-speed UDP broadcast network queue floods
+    private long lastFrameTime = 0;
+    private static final long FRAME_INTERVAL_MS = 100; // Limit capturing to ~10 FPS
+
     // Static listener to relay local camera frame bitmaps back to our active UI layout
     private static volatile LocalFrameListener localFrameListener;
 
@@ -84,6 +88,14 @@ public class VideoCaptureManager {
                             imageProxy.close();
                             return;
                         }
+
+                        // Apply Frame-Rate Throttling check before execution of conversion algorithms
+                        long currentTime = System.currentTimeMillis();
+                        if (currentTime - lastFrameTime < FRAME_INTERVAL_MS) {
+                            imageProxy.close();
+                            return;
+                        }
+                        lastFrameTime = currentTime;
 
                         Image img = imageProxy.getImage();
                         if (img != null) {
