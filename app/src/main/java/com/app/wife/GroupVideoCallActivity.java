@@ -126,10 +126,14 @@ public class GroupVideoCallActivity extends AppCompatActivity implements
                 WifeLogger.log(TAG, "Device profile is VIBRATE. Suppressing ringtone, starting vibration (Glitch 6 Fix).");
                 if (vibratorService != null && vibratorService.hasVibrator()) {
                     long[] pattern = {0, 600, 800}; // Vibrate 600ms, pause 800ms
-                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                        vibratorService.vibrate(VibrationEffect.createWaveform(pattern, 0)); // Loop from index 0
-                    } else {
-                        vibratorService.vibrate(pattern, 0);
+                    try {
+                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                            vibratorService.vibrate(VibrationEffect.createWaveform(pattern, 0)); // Loop from index 0
+                        } else {
+                            vibratorService.vibrate(pattern, 0);
+                        }
+                    } catch (SecurityException e) {
+                        WifeLogger.log(TAG, "Missing android.permission.VIBRATE in manifest (Glitch 6 Defensive Wrap).", e);
                     }
                 }
                 return;
@@ -151,7 +155,11 @@ public class GroupVideoCallActivity extends AppCompatActivity implements
     private void stopRingtone() {
         if (vibratorService != null) {
             WifeLogger.log(TAG, "Halting active vibrator channels.");
-            vibratorService.cancel();
+            try {
+                vibratorService.cancel();
+            } catch (SecurityException e) {
+                WifeLogger.log(TAG, "Failed to cancel vibration programmatically (Glitch 6 Defensive Wrap).", e);
+            }
         }
         if (ringtonePlayer != null) {
             try {
