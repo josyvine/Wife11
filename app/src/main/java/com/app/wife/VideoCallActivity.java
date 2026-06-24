@@ -208,7 +208,8 @@ public class VideoCallActivity extends AppCompatActivity implements
     private void declineOrEndCall() {
         stopRingtone();
         WifeLogger.log(TAG, "declineOrEndCall() invoked. Processing signal termination...");
-        if (isInbound && binding.fabAcceptVideo.setVisibility() == View.VISIBLE) {
+        // Fixed: Updated setVisibility() to getVisibility() to correct the build compiler error (Glitch 6 Fix Verification)
+        if (isInbound && binding.fabAcceptVideo.getVisibility() == View.VISIBLE) {
             WifeLogger.log(TAG, "Call declined before connection. Dispatching REJECT signal to: " + peerIp);
             CallSignalingManager.getInstance(this).sendSignal(peerIp, Constants.SIGNAL_VIDEO_REJECT);
         } else {
