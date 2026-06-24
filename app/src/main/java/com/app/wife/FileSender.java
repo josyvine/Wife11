@@ -16,6 +16,7 @@ import java.io.File;
 import java.io.FileInputStream;
 import java.io.FileOutputStream;
 import java.io.IOException;
+import java.io.InputStream;
 import java.io.OutputStream;
 import java.net.InetSocketAddress;
 import java.nio.ByteBuffer;
@@ -132,17 +133,17 @@ public class FileSender {
                         // Compress source file locally to a temp cache file before sending
                         WifeLogger.log(TAG, "Compressing local file to temporary cache archive with optimized buffers.");
                         
-                        try (ParcelFileDescriptor pfd = context.getContentResolver().openFileDescriptor(fileUri, "r");
-                             FileInputStream fis = new FileInputStream(pfd.getFileDescriptor());
+                        // Upgraded content URI opener to handle temporary read authorization in background context (0% Stall Fix)
+                        try (InputStream is = context.getContentResolver().openInputStream(fileUri);
                              FileOutputStream fos = new FileOutputStream(tempCompressedFile);
                              net.jpountz.lz4.LZ4FrameOutputStream lz4Out = new net.jpountz.lz4.LZ4FrameOutputStream(fos)) {
                             
-                            byte[] buffer = new byte[131072]; // High-speed 128KB buffer (15x faster than original 8KB chunks)
+                            byte[] buffer = new byte[65536]; // Optimized 64KB stream buffer
                             long bytesReadTotal = 0;
                             int read;
                             long lastProgressUpdate = 0;
                             
-                            while ((read = fis.read(buffer)) != -1) {
+                            while ((read = is.read(buffer)) != -1) {
                                 if (FileTransferForegroundService.isCancelled) {
                                     break;
                                 }
@@ -169,14 +170,12 @@ public class FileSender {
                                 long currentTime = System.currentTimeMillis();
                                 if (currentTime - lastProgressUpdate >= 500) {
                                     int percent = (fileSize > 0) ? (int) ((bytesReadTotal * 100) / fileSize) : 0;
-                                    // Update foreground notification safely.
-                                    // NOTE: We do not broadcast ACTION_TRANSFER_PROGRESS locally during preparation 
-                                    // to prevent corrupting the UI data-formatting or speed calculation states.
-                                    updatePrepNotification(fileName, percent);
+                                    
+                                    // Symmetrically broadcast actual progress metrics during preparation to animate the 0% stuck UI
+                                    broadcastProgress("Compressing: " + fileName, bytesReadTotal, fileSize, percent, i, 0.0);
                                     lastProgressUpdate = currentTime;
                                 }
                             }
-                            // Stream close() (inside try-with-resources auto-close) writes the final magic framing boundary markers
                         }
 
                         long compressedSize = tempCompressedFile.length();
@@ -312,7 +311,15 @@ public class FileSender {
                 WifeLogger.log(TAG, "Persistent file sending pipeline threw fatal exception: " + e.getMessage(), e);
                 broadcastError(e.getMessage());
             } finally {
-                // Symmetrical clean up of channel streams
+                // Symmetrical flush clean up of channel streams (98% completion freeze fix)
+                try {
+                    if (socketChannel != null && socketChannel.socket() != null && !socketChannel.socket().isClosed()) {
+                        WifeLogger.log(TAG, "Gracefully shutting down outbound socket channel stream.");
+                        socketChannel.socket().shutdownOutput();
+                        Thread.sleep(500); // Allow a 500ms grace window to cleanly digest the EOF on receiver phone
+                    }
+                } catch (Exception ignored) {}
+
                 try {
                     if (socketChannel != null && socketChannel.isOpen()) {
                         socketChannel.close();
