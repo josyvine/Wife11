@@ -12,6 +12,8 @@ import androidx.localbroadcastmanager.content.LocalBroadcastManager;
 
 import com.google.gson.JsonObject;
 
+import java.io.BufferedInputStream;
+import java.io.BufferedOutputStream;
 import java.io.File;
 import java.io.FileInputStream;
 import java.io.FileOutputStream;
@@ -131,15 +133,60 @@ public class FileSender {
 
                     try {
                         // Compress source file locally to a temp cache file before sending
-                        WifeLogger.log(TAG, "Compressing local file to temporary cache archive.");
+                        WifeLogger.log(TAG, "Compressing local file to temporary cache archive with real-time progress updates.");
+                        
                         try (ParcelFileDescriptor pfd = context.getContentResolver().openFileDescriptor(fileUri, "r");
                              FileInputStream fis = new FileInputStream(pfd.getFileDescriptor());
-                             FileOutputStream fos = new FileOutputStream(tempCompressedFile)) {
-                            CompressionUtils.compress(fis, fos);
+                             BufferedInputStream bis = new BufferedInputStream(fis, 262144);
+                             FileOutputStream fos = new FileOutputStream(tempCompressedFile);
+                             BufferedOutputStream bos = new BufferedOutputStream(fos, 262144);
+                             net.jpountz.lz4.LZ4FrameOutputStream lz4Out = new net.jpountz.lz4.LZ4FrameOutputStream(bos)) {
+                            
+                            byte[] buffer = new byte[262144]; // 256KB high-speed buffer
+                            long bytesReadTotal = 0;
+                            int read;
+                            long lastProgressUpdate = 0;
+                            
+                            while ((read = bis.read(buffer)) != -1) {
+                                if (FileTransferForegroundService.isCancelled) {
+                                    break;
+                                }
+                                
+                                // Symmetrical Thread-Safe Pause/Resume wait monitor locks for preparation
+                                synchronized (FileTransferForegroundService.pauseLock) {
+                                    while (FileTransferForegroundService.isPaused && !FileTransferForegroundService.isCancelled) {
+                                        try {
+                                            WifeLogger.log(TAG, "Compression thread suspended due to pause state.");
+                                            FileTransferForegroundService.pauseLock.wait();
+                                        } catch (InterruptedException e) {
+                                            Thread.currentThread().interrupt();
+                                        }
+                                    }
+                                }
+                                
+                                if (FileTransferForegroundService.isCancelled) {
+                                    break;
+                                }
+                                
+                                lz4Out.write(buffer, 0, read);
+                                bytesReadTotal += read;
+                                
+                                long currentTime = System.currentTimeMillis();
+                                if (currentTime - lastProgressUpdate >= 500) {
+                                    int percent = (fileSize > 0) ? (int) ((bytesReadTotal * 100) / fileSize) : 0;
+                                    broadcastPrepProgress(fileName, percent, i);
+                                    lastProgressUpdate = currentTime;
+                                }
+                            }
+                            lz4Out.flush();
                         }
 
                         long compressedSize = tempCompressedFile.length();
                         WifeLogger.log(TAG, "Compression complete. Compressed Size: " + compressedSize + " bytes.");
+
+                        if (FileTransferForegroundService.isCancelled) {
+                            break;
+                        }
 
                         // 3. Serialize and transmit metadata descriptor
                         JsonObject fileMeta = new JsonObject();
@@ -283,6 +330,22 @@ public class FileSender {
 
     private ByteBuffer metadataBuffer(byte[] metaBytes) {
         return ByteBuffer.wrap(metaBytes);
+    }
+
+    private void broadcastPrepProgress(String fileName, int percent, int fileIndex) {
+        Intent intent = new Intent(Constants.ACTION_TRANSFER_PROGRESS);
+        intent.putExtra(Constants.EXTRA_FILE_NAME, fileName);
+        intent.putExtra(Constants.EXTRA_BYTES_TRANSFERRED, (long) percent);
+        intent.putExtra(Constants.EXTRA_TOTAL_BYTES, 100L); // Using percentage bounds for preparation
+        intent.putExtra(Constants.EXTRA_FILE_INDEX, fileIndex);
+        intent.putExtra(Constants.EXTRA_TRANSFER_SPEED, 0.0);
+        LocalBroadcastManager.getInstance(context).sendBroadcast(intent);
+
+        Intent serviceIntent = new Intent(context, FileTransferForegroundService.class);
+        serviceIntent.setAction("UPDATE_NOTIF");
+        serviceIntent.putExtra("NOTIF_TEXT", "Compressing " + fileName + " (" + percent + "%)");
+        serviceIntent.putExtra("PROGRESS", percent);
+        context.startService(serviceIntent);
     }
 
     private void broadcastProgress(String fileName, long transferred, long total, int percent, int fileIndex, double speed) {
