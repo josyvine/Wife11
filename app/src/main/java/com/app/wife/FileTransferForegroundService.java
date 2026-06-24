@@ -127,6 +127,12 @@ public class FileTransferForegroundService extends Service {
                     synchronized (pauseLock) {
                         pauseLock.notifyAll();
                     }
+
+                    // Symmetrical broadcast update to force UI closure in FileTransferActivity (Glitch 2 Fix)
+                    Intent cancelIntent = new Intent(Constants.ACTION_TRANSFER_ERROR);
+                    cancelIntent.putExtra(Constants.EXTRA_ERROR_MESSAGE, "Transfer cancelled by user.");
+                    androidx.localbroadcastmanager.content.LocalBroadcastManager.getInstance(this).sendBroadcast(cancelIntent);
+
                     stopForeground(true);
                     stopSelf();
                     break;
