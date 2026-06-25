@@ -13,6 +13,8 @@ import androidx.localbroadcastmanager.content.LocalBroadcastManager;
 import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
 
+import java.io.BufferedInputStream;
+import java.io.BufferedOutputStream;
 import java.io.File;
 import java.io.FileInputStream;
 import java.io.FileOutputStream;
@@ -28,6 +30,8 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Locale;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 import java.util.concurrent.atomic.AtomicInteger;
 
 public class FileReceiver implements Runnable {
@@ -45,8 +49,11 @@ public class FileReceiver implements Runnable {
 
     private static final List<FileReceiveListener> listeners = new ArrayList<>();
     
-    // Thread-safe map tracking aggregate chunks received per active file transaction
+    // Thread-safe map tracking completed chunks per active transaction
     private static final ConcurrentHashMap<String, AtomicInteger> activeTransfers = new ConcurrentHashMap<>();
+
+    // Managed fixed-size thread pool to execute socket receivers concurrently without system thread exhaustion
+    private static final ExecutorService receiverExecutor = Executors.newFixedThreadPool(5);
 
     public static synchronized void registerListener(FileReceiveListener listener) {
         if (!listeners.contains(listener)) {
@@ -101,8 +108,9 @@ public class FileReceiver implements Runnable {
                         clientChannel.configureBlocking(true);
 
                         final SocketChannel finalChannel = clientChannel;
-                        // Spawns background worker thread instantly to process parallel chunk streams concurrently (Glitch 1 & parallel Fix)
-                        new Thread(() -> {
+                        
+                        // Hand off accepted connection to the executor pool to support up to 5 parallel workers safely
+                        receiverExecutor.execute(() -> {
                             try {
                                 String clientIp = finalChannel.socket().getInetAddress().getHostAddress();
                                 WifeLogger.log(TAG, "Processing parallel transfer stream connection from: " + clientIp);
@@ -115,7 +123,7 @@ public class FileReceiver implements Runnable {
                                     finalChannel.close();
                                 } catch (IOException ignored) {}
                             }
-                        }).start();
+                        });
 
                     } catch (Exception e) {
                         WifeLogger.log(TAG, "Active socket connection accept failed: " + e.getMessage(), e);
@@ -141,7 +149,6 @@ public class FileReceiver implements Runnable {
      * Processes metadata headers and LZ4 decompression segments sequentially over the active SocketChannel.
      */
     private static void processPersistentStream(Context context, SocketChannel socketChannel) throws Exception {
-        // Reset static cancellation state for this fresh inbound transaction
         FileTransferForegroundService.isCancelled = false;
         FileTransferForegroundService.isPaused = false;
 
@@ -150,11 +157,9 @@ public class FileReceiver implements Runnable {
         int fileIndex = 0;
 
         while (!FileTransferForegroundService.isCancelled && socketChannel.isConnected()) {
-            // 1. Read the 4-byte metadata length header directly from proxyIn
             byte[] lenBytes = new byte[4];
             int bytesRead = 0;
             while (bytesRead < 4 && !FileTransferForegroundService.isCancelled) {
-                // Symmetrical Thread-Safe Pause/Resume wait monitor locks
                 synchronized (FileTransferForegroundService.pauseLock) {
                     while (FileTransferForegroundService.isPaused && !FileTransferForegroundService.isCancelled) {
                         try {
@@ -183,24 +188,20 @@ public class FileReceiver implements Runnable {
                 break;
             }
 
-            // Decode big-endian integer length
             int metadataLength = ((lenBytes[0] & 0xFF) << 24) |
                                  ((lenBytes[1] & 0xFF) << 16) |
                                  ((lenBytes[2] & 0xFF) << 8)  |
                                  (lenBytes[3] & 0xFF);
 
-            // 0 metadata length indicates the persistent queue transfer session has completed naturally
             if (metadataLength == 0) {
                 WifeLogger.log(TAG, "End of persistent queue stream marker received. Closing stream.");
                 broadcastCompletion(context);
                 break;
             }
 
-            // 2. Read exactly the serialized JSON metadata payload directly from proxyIn
             byte[] metaBytes = new byte[metadataLength];
             bytesRead = 0;
             while (bytesRead < metadataLength && !FileTransferForegroundService.isCancelled) {
-                // Symmetrical Thread-Safe Pause/Resume wait monitor locks
                 synchronized (FileTransferForegroundService.pauseLock) {
                     while (FileTransferForegroundService.isPaused && !FileTransferForegroundService.isCancelled) {
                         try {
@@ -236,12 +237,12 @@ public class FileReceiver implements Runnable {
             final long compressedSize = meta.get("compressedSize").getAsLong();
             long resumePosition = meta.has("lastPosition") ? meta.get("lastPosition").getAsLong() : 0;
             
-            // Check for chunk-type parallel transmissions
             String transferType = meta.has("type") ? meta.get("type").getAsString() : "file";
 
             WifeLogger.log(TAG, "Processing incoming payload: " + filename + " | Type: " + transferType + " | Size: " + originalSize + " bytes");
 
             File targetDir = getTargetDirectory(context, filename);
+            File backupDir = getBackupDirectory();
 
             if ("chunk".equals(transferType)) {
                 final String fileId = meta.get("fileId").getAsString();
@@ -250,12 +251,12 @@ public class FileReceiver implements Runnable {
 
                 WifeLogger.log(TAG, "Processing parallel chunk [" + chunkIndex + "/" + totalChunks + "] for File ID: " + fileId);
 
-                File tempCompressedChunk = new File(context.getCacheDir(), "chunk_" + fileId + "_" + chunkIndex + ".lz4");
-                File tempRawChunk = new File(context.getCacheDir(), "chunk_" + fileId + "_" + chunkIndex + ".raw");
+                File tempCompressedChunk = new File(backupDir, "chunk_" + fileId + "_" + chunkIndex + ".lz4");
+                File tempRawChunk = new File(backupDir, "chunk_" + fileId + "_" + chunkIndex + ".raw");
 
-                // 3. Receive and decompress chunk bytes
                 try {
-                    try (FileOutputStream fos = new FileOutputStream(tempCompressedChunk)) {
+                    try (FileOutputStream fos = new FileOutputStream(tempCompressedChunk);
+                         BufferedOutputStream bos = new BufferedOutputStream(fos, 128 * 1024)) {
                         byte[] buffer = new byte[16384];
                         long totalBytesRead = 0;
                         while (totalBytesRead < compressedSize && !FileTransferForegroundService.isCancelled) {
@@ -264,29 +265,27 @@ public class FileReceiver implements Runnable {
                             if (read == -1) {
                                 throw new IOException("Connection severed abruptly during raw chunk payload transfer.");
                             }
-                            fos.write(buffer, 0, read);
+                            bos.write(buffer, 0, read);
                             totalBytesRead += read;
                         }
-                        fos.flush();
+                        bos.flush();
                     }
 
                     if (!FileTransferForegroundService.isCancelled) {
-                        // Decompress chunk locally
                         try (FileInputStream fis = new FileInputStream(tempCompressedChunk);
-                             FileOutputStream fos = new FileOutputStream(tempRawChunk)) {
-                            CompressionUtils.decompress(fis, fos);
+                             BufferedInputStream bis = new BufferedInputStream(fis, 128 * 1024);
+                             FileOutputStream fos = new FileOutputStream(tempRawChunk);
+                             BufferedOutputStream bos = new BufferedOutputStream(fos, 128 * 1024)) {
+                            CompressionUtils.decompress(bis, bos);
                         }
 
-                        // Track active completed chunks for this specific transaction ID
                         activeTransfers.putIfAbsent(fileId, new AtomicInteger(0));
                         int completed = activeTransfers.get(fileId).incrementAndGet();
 
-                        // Symmetrical Progress notification
                         int percent = (completed * 100) / totalChunks;
-                        notifyProgress(context, filename, percent, completed * 20L * 1024L * 1024L, originalSize, fileIndex, 0.0);
+                        notifyChunkProgress(context, filename, percent, completed * 20L * 1024L * 1024L, originalSize, fileIndex, 0.0, chunkIndex, completed * 20L * 1024L * 1024L, originalSize);
 
                         if (completed == totalChunks) {
-                            // All parts arrived. Spin up the merger thread to assemble the final target file
                             mergeChunksAndFinalize(context, fileId, totalChunks, targetDir, filename, originalSize, fileIndex);
                         }
                     }
@@ -295,17 +294,15 @@ public class FileReceiver implements Runnable {
                         tempCompressedChunk.delete();
                     }
                 }
-
-                // Chunk socket connection terminates immediately after writing the individual part
                 break;
 
             } else {
-                // STANDARD SEQUENTIAL SINGLE-FILE TRANSFER
                 File fileDest = new File(targetDir, filename);
-                File tempCompressedFile = new File(context.getCacheDir(), "temp_recv_" + System.currentTimeMillis() + "_" + filename + ".lz4");
+                File tempCompressedFile = new File(backupDir, "temp_recv_" + System.currentTimeMillis() + "_" + filename + ".lz4");
 
                 try {
-                    try (FileOutputStream fos = new FileOutputStream(tempCompressedFile, resumePosition > 0)) {
+                    try (FileOutputStream fos = new FileOutputStream(tempCompressedFile, resumePosition > 0);
+                         BufferedOutputStream bos = new BufferedOutputStream(fos, 128 * 1024)) {
                         byte[] buffer = new byte[16384];
                         long totalBytesRead = resumePosition;
                         long lastNotificationUpdateTime = System.currentTimeMillis();
@@ -332,7 +329,7 @@ public class FileReceiver implements Runnable {
                                 throw new IOException("Connection severed abruptly during raw payload transfer.");
                             }
 
-                            fos.write(buffer, 0, read);
+                            bos.write(buffer, 0, read);
                             totalBytesRead += read;
                             speedPeriodBytesRead += read;
 
@@ -350,15 +347,17 @@ public class FileReceiver implements Runnable {
                                 lastNotificationUpdateTime = currentTime;
                             }
                         }
-                        fos.flush();
+                        bos.flush();
                     }
 
                     if (!FileTransferForegroundService.isCancelled) {
                         WifeLogger.log(TAG, "Compressed payload received. Decompressing file locally: " + fileDest.getAbsolutePath());
 
                         try (FileInputStream fis = new FileInputStream(tempCompressedFile);
-                             FileOutputStream fos = new FileOutputStream(fileDest)) {
-                            CompressionUtils.decompress(fis, fos);
+                             BufferedInputStream bis = new BufferedInputStream(fis, 128 * 1024);
+                             FileOutputStream fos = new FileOutputStream(fileDest);
+                             BufferedOutputStream bos = new BufferedOutputStream(fos, 128 * 1024)) {
+                            CompressionUtils.decompress(bis, bos);
                         }
 
                         WifeLogger.log(TAG, "File successfully decrypted and saved: " + fileDest.getAbsolutePath());
@@ -379,45 +378,31 @@ public class FileReceiver implements Runnable {
     }
 
     /**
-     * Glues raw temporary chunk files back into a single valid uncompressed file (Glitch 1 Merge Fix).
+     * Glues raw temporary chunk files back into a single valid uncompressed file via the high-speed FileJoiner.
      */
     private static void mergeChunksAndFinalize(Context context, String fileId, int totalChunks, File targetDir, String filename, long originalSize, int fileIndex) {
         new Thread(() -> {
             File fileDest = new File(targetDir, filename);
             WifeLogger.log(TAG, "All chunks received. Merging chunk parts into final file: " + fileDest.getAbsolutePath());
 
-            try (FileOutputStream fos = new FileOutputStream(fileDest)) {
-                byte[] buffer = new byte[131072]; // High-performance 128KB buffer
-                
-                for (int chunkIndex = 0; chunkIndex < totalChunks; chunkIndex++) {
-                    File tempRawChunk = new File(context.getCacheDir(), "chunk_" + fileId + "_" + chunkIndex + ".raw");
-                    if (!tempRawChunk.exists()) {
-                        throw new IOException("Missing parallel chunk part index: " + chunkIndex);
-                    }
+            boolean success = FileJoiner.mergeParts(context, fileId, totalChunks, fileDest);
 
-                    try (FileInputStream fis = new FileInputStream(tempRawChunk)) {
-                        int read;
-                        while ((read = fis.read(buffer)) != -1) {
-                            fos.write(buffer, 0, read);
-                        }
-                    }
-                    // Delete temporary segment instantly to preserve disk storage (ENOSPC fix)
-                    tempRawChunk.delete();
+            if (success) {
+                try {
+                    WifeLogger.log(TAG, "File successfully decrypted, merged and saved: " + fileDest.getAbsolutePath());
+
+                    FileEntity entity = new FileEntity(filename, originalSize, fileDest.getAbsolutePath(), System.currentTimeMillis());
+                    RoomDatabaseManager.getInstance(context).fileDao().insert(entity);
+
+                    notifyComplete(context, filename, fileDest.getAbsolutePath(), fileIndex);
+                    activeTransfers.remove(fileId);
+                } catch (Exception e) {
+                    WifeLogger.log(TAG, "Database log persistence failed after zero-copy merge: " + e.getMessage(), e);
+                    broadcastError(context, e.getMessage());
                 }
-                fos.flush();
-
-                WifeLogger.log(TAG, "File successfully decrypted, merged and saved: " + fileDest.getAbsolutePath());
-
-                // Save history record in database
-                FileEntity entity = new FileEntity(filename, originalSize, fileDest.getAbsolutePath(), System.currentTimeMillis());
-                RoomDatabaseManager.getInstance(context).fileDao().insert(entity);
-
-                notifyComplete(context, filename, fileDest.getAbsolutePath(), fileIndex);
-                activeTransfers.remove(fileId);
-
-            } catch (Exception e) {
-                WifeLogger.log(TAG, "Merge and finalize failed for file ID " + fileId + ": " + e.getMessage(), e);
-                broadcastError(context, e.getMessage());
+            } else {
+                WifeLogger.log(TAG, "Zero-copy chunk merge operation failed for File ID: " + fileId);
+                broadcastError(context, "Assembling of the chunked payload failed on receiver side.");
             }
         }).start();
     }
@@ -480,6 +465,19 @@ public class FileReceiver implements Runnable {
         return targetDir;
     }
 
+    private static File getBackupDirectory() {
+        File rootDir;
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            rootDir = new File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS), "wife shared/backups");
+        } else {
+            rootDir = new File(Environment.getExternalStorageDirectory(), "wife shared/backups");
+        }
+        if (!rootDir.exists()) {
+            rootDir.mkdirs();
+        }
+        return rootDir;
+    }
+
     // --- UI/Notification Broadcast dispatchers ---
 
     private static void notifyProgress(Context context, final String filename, final int percent, long transferred, long total, int fileIndex, double speed) {
@@ -491,20 +489,48 @@ public class FileReceiver implements Runnable {
             }
         });
 
-        // Intent broadcast to FileTransferActivity with transmission rate metrics
         Intent intent = new Intent(Constants.ACTION_TRANSFER_PROGRESS);
         intent.putExtra(Constants.EXTRA_FILE_NAME, filename);
         intent.putExtra(Constants.EXTRA_BYTES_TRANSFERRED, transferred);
         intent.putExtra(Constants.EXTRA_TOTAL_BYTES, total);
         intent.putExtra(Constants.EXTRA_FILE_INDEX, fileIndex);
         intent.putExtra(Constants.EXTRA_TRANSFER_SPEED, speed);
+        intent.putExtra("IS_CHUNK", false);
         LocalBroadcastManager.getInstance(context).sendBroadcast(intent);
 
-        // Foreground Service Notification update
         String speedText = String.format(Locale.US, "%.1f MB/s", speed);
         Intent serviceIntent = new Intent(context, FileTransferForegroundService.class);
         serviceIntent.setAction("UPDATE_NOTIF");
         serviceIntent.putExtra("NOTIF_TEXT", "Receiving " + filename + " (" + percent + "%) - " + speedText);
+        serviceIntent.putExtra("PROGRESS", percent);
+        context.startService(serviceIntent);
+    }
+
+    private static void notifyChunkProgress(Context context, final String filename, final int percent, long transferred, long total, int fileIndex, double speed, int chunkIndex, long chunkTransferred, long chunkTotal) {
+        new Handler(Looper.getMainLooper()).post(() -> {
+            synchronized (FileReceiver.class) {
+                for (FileReceiveListener l : listeners) {
+                    l.onProgress(filename, percent);
+                }
+            }
+        });
+
+        Intent intent = new Intent(Constants.ACTION_TRANSFER_PROGRESS);
+        intent.putExtra(Constants.EXTRA_FILE_NAME, filename);
+        intent.putExtra(Constants.EXTRA_BYTES_TRANSFERRED, transferred);
+        intent.putExtra(Constants.EXTRA_TOTAL_BYTES, total);
+        intent.putExtra(Constants.EXTRA_FILE_INDEX, fileIndex);
+        intent.putExtra(Constants.EXTRA_TRANSFER_SPEED, speed);
+        intent.putExtra("IS_CHUNK", true);
+        intent.putExtra("CHUNK_INDEX", chunkIndex);
+        intent.putExtra("CHUNK_BYTES_TRANSFERRED", chunkTransferred);
+        intent.putExtra("CHUNK_TOTAL_BYTES", chunkTotal);
+        LocalBroadcastManager.getInstance(context).sendBroadcast(intent);
+
+        String speedText = String.format(Locale.US, "%.1f MB/s", speed);
+        Intent serviceIntent = new Intent(context, FileTransferForegroundService.class);
+        serviceIntent.setAction("UPDATE_NOTIF");
+        serviceIntent.putExtra("NOTIF_TEXT", "Receiving Chunk #" + (chunkIndex + 1) + " of " + filename + " (" + percent + "%) - " + speedText);
         serviceIntent.putExtra("PROGRESS", percent);
         context.startService(serviceIntent);
     }
@@ -520,7 +546,7 @@ public class FileReceiver implements Runnable {
 
         Intent intent = new Intent(Constants.ACTION_TRANSFER_PROGRESS);
         intent.putExtra(Constants.EXTRA_FILE_NAME, filename);
-        intent.putExtra(Constants.EXTRA_BYTES_TRANSFERRED, 1L); // Force complete UI redraw
+        intent.putExtra(Constants.EXTRA_BYTES_TRANSFERRED, 1L); 
         intent.putExtra(Constants.EXTRA_TOTAL_BYTES, 1L);
         intent.putExtra(Constants.EXTRA_FILE_INDEX, fileIndex);
         LocalBroadcastManager.getInstance(context).sendBroadcast(intent);
@@ -530,7 +556,6 @@ public class FileReceiver implements Runnable {
         Intent intent = new Intent(Constants.ACTION_TRANSFER_COMPLETE);
         LocalBroadcastManager.getInstance(context).sendBroadcast(intent);
 
-        // Symmetrical service cleanup to resolve Glitch 3 (Clears Receiver sticky notification)
         Intent stopIntent = new Intent(context, FileTransferForegroundService.class);
         context.stopService(stopIntent);
     }
@@ -540,7 +565,6 @@ public class FileReceiver implements Runnable {
         intent.putExtra(Constants.EXTRA_ERROR_MESSAGE, message);
         LocalBroadcastManager.getInstance(context).sendBroadcast(intent);
 
-        // Symmetrical service cleanup on error to resolve Glitch 3 (Clears Receiver sticky notification)
         Intent stopIntent = new Intent(context, FileTransferForegroundService.class);
         context.stopService(stopIntent);
     }
@@ -555,7 +579,6 @@ public class FileReceiver implements Runnable {
         });
     }
 
-    // --- Symmetrical Non-Closing Socket Stream Wrapper ---
     private static class NonClosingInputStream extends InputStream {
         private final InputStream delegate;
 
@@ -575,7 +598,6 @@ public class FileReceiver implements Runnable {
 
         @Override
         public void close() throws IOException {
-            // Intercept close() commands to prevent closing the underlying persistent socket
             Log.d(TAG, "Intercepted close() request. Stream remains open.");
         }
     }
