@@ -103,6 +103,33 @@ public class WiFiDirectManager {
     }
 
     @SuppressLint("MissingPermission")
+    public void stopPeerDiscovery() {
+        stopPeerDiscovery(null);
+    }
+
+    @SuppressLint("MissingPermission")
+    public void stopPeerDiscovery(final WifiP2pManager.ActionListener listener) {
+        if (p2pManager == null || channel == null) return;
+        p2pManager.stopPeerDiscovery(channel, new WifiP2pManager.ActionListener() {
+            @Override
+            public void onSuccess() {
+                Log.d(TAG, "Peer discovery stopped successfully.");
+                if (listener != null) {
+                    listener.onSuccess();
+                }
+            }
+
+            @Override
+            public void onFailure(int reason) {
+                Log.e(TAG, "Failed to stop peer discovery. Reason: " + reason);
+                if (listener != null) {
+                    listener.onFailure(reason);
+                }
+            }
+        });
+    }
+
+    @SuppressLint("MissingPermission")
     public void connect(final WifiP2pDevice device, final WifiP2pManager.ActionListener listener) {
         if (p2pManager == null || channel == null || device == null) return;
         WifiP2pConfig config = new WifiP2pConfig();
