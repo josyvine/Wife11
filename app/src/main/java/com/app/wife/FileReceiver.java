@@ -178,7 +178,14 @@ public class FileReceiver implements Runnable {
 
                 int read = proxyIn.read(lenBytes, bytesRead, 4 - bytesRead);
                 if (read == -1) {
-                    WifeLogger.log(TAG, "Stream ended abruptly while reading metadata length.");
+                    // Symmetrical solution for single/multi file sequential queues:
+                    // If stream ends gracefully on file boundary, shut down UI & Service cleanly (Glitch Fix)
+                    if (bytesRead == 0) {
+                        WifeLogger.log(TAG, "Persistent stream disconnected cleanly by sender. Closing queue.");
+                        broadcastCompletion(context);
+                    } else {
+                        WifeLogger.log(TAG, "Stream ended abruptly while reading metadata length.");
+                    }
                     return;
                 }
                 bytesRead += read;
@@ -395,6 +402,11 @@ public class FileReceiver implements Runnable {
                     RoomDatabaseManager.getInstance(context).fileDao().insert(entity);
 
                     notifyComplete(context, filename, fileDest.getAbsolutePath(), fileIndex);
+                    
+                    // Symmetrical solution for parallel chunked files:
+                    // Force complete system tray notification and layout dismissal on parallel merge completion (Glitch Fix)
+                    broadcastCompletion(context);
+                    
                     activeTransfers.remove(fileId);
                 } catch (Exception e) {
                     WifeLogger.log(TAG, "Database log persistence failed after zero-copy merge: " + e.getMessage(), e);
