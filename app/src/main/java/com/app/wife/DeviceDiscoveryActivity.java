@@ -26,6 +26,9 @@ public class DeviceDiscoveryActivity extends AppCompatActivity implements
     private WiFiDirectManager wifiDirectManager;
     private DeviceAdapter adapter;
     private final List<WifiP2pDevice> peerList = new ArrayList<>();
+    
+    // State guard to prevent multi-selection or double-connection race conditions
+    private boolean isConnecting = false;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -41,6 +44,10 @@ public class DeviceDiscoveryActivity extends AppCompatActivity implements
         setupRecyclerView();
 
         binding.btnStartDiscovery.setOnClickListener(v -> {
+            if (isConnecting) {
+                WifeLogger.log(TAG, "Mesh scan click ignored: Connection attempt in progress.");
+                return;
+            }
             WifeLogger.log(TAG, "User triggered INITIATE MESH SCAN button. Starting peer discovery sweep.");
             binding.pbDiscoveryProgress.setVisibility(View.VISIBLE);
             wifiDirectManager.discoverPeers();
@@ -65,35 +72,68 @@ public class DeviceDiscoveryActivity extends AppCompatActivity implements
     private void setupRecyclerView() {
         WifeLogger.log(TAG, "Initializing DeviceAdapter and binding LayoutManager to RecyclerView.");
         adapter = new DeviceAdapter(peerList, device -> {
+            if (isConnecting) {
+                WifeLogger.log(TAG, "User interaction blocked: A connection attempt is already in progress.");
+                return;
+            }
+            
+            // Lock UI controls immediately to prevent race conditions
+            isConnecting = true;
+            binding.btnStartDiscovery.setEnabled(false);
+            binding.rvDiscoveredDevices.setEnabled(false);
+
             String deviceDetails = "Name: " + device.deviceName + " | Mac: " + device.deviceAddress;
             WifeLogger.log(TAG, "User selected target device for connection. " + deviceDetails);
             Toast.makeText(this, "Connecting to " + device.deviceName + "...", Toast.LENGTH_SHORT).show();
             
-            wifiDirectManager.connect(device, new WifiP2pManager.ActionListener() {
+            // Critical fix: We must stop the active peer discovery process before connecting
+            WifeLogger.log(TAG, "Halting peer discovery scans before executing connect call.");
+            wifiDirectManager.stopPeerDiscovery(new WifiP2pManager.ActionListener() {
                 @Override
                 public void onSuccess() {
-                    WifeLogger.log(TAG, "P2P connection request successfully queued by the system framework.");
-                    Toast.makeText(DeviceDiscoveryActivity.this, "Connection request posted successfully.", Toast.LENGTH_SHORT).show();
+                    WifeLogger.log(TAG, "Peer discovery stopped successfully. Dispatching connection request.");
+                    executeConnection(device);
                 }
 
                 @Override
                 public void onFailure(int reason) {
-                    WifeLogger.log(TAG, "P2P connection request rejected by system framework. Reason Code: " + reason);
-                    
-                    // Defensive check: If reason is 0 (generic system error) but the group is already formed,
-                    // bypass the failure, notify the user, and return to the main dashboard.
-                    if (reason == 0 && wifiDirectManager.getConnectionInfo() != null && wifiDirectManager.getConnectionInfo().groupFormed) {
-                        WifeLogger.log(TAG, "Bypassing Reason: 0 because the P2P connection group is already active under-the-hood. Redirecting to home.");
-                        Toast.makeText(DeviceDiscoveryActivity.this, "P2P Network is already connected. Returning to home.", Toast.LENGTH_SHORT).show();
-                        finish();
-                    } else {
-                        Toast.makeText(DeviceDiscoveryActivity.this, "Failed connecting. Reason: " + reason, Toast.LENGTH_SHORT).show();
-                    }
+                    WifeLogger.log(TAG, "Failed to stop peer discovery before connecting. Reason: " + reason + ". Proceeding anyway.");
+                    executeConnection(device);
                 }
             });
         });
         binding.rvDiscoveredDevices.setLayoutManager(new LinearLayoutManager(this));
         binding.rvDiscoveredDevices.setAdapter(adapter);
+    }
+
+    private void executeConnection(WifiP2pDevice device) {
+        wifiDirectManager.connect(device, new WifiP2pManager.ActionListener() {
+            @Override
+            public void onSuccess() {
+                WifeLogger.log(TAG, "P2P connection request successfully queued by the system framework.");
+                Toast.makeText(DeviceDiscoveryActivity.this, "Connection request posted successfully.", Toast.LENGTH_SHORT).show();
+            }
+
+            @Override
+            public void onFailure(int reason) {
+                WifeLogger.log(TAG, "P2P connection request rejected by system framework. Reason Code: " + reason);
+                
+                // Unlock UI controls on failure
+                isConnecting = false;
+                binding.btnStartDiscovery.setEnabled(true);
+                binding.rvDiscoveredDevices.setEnabled(true);
+
+                // Defensive check: If reason is 0 (generic system error) but the group is already formed,
+                // bypass the failure, notify the user, and return to the main dashboard.
+                if (reason == 0 && wifiDirectManager.getConnectionInfo() != null && wifiDirectManager.getConnectionInfo().groupFormed) {
+                    WifeLogger.log(TAG, "Bypassing Reason: 0 because the P2P connection group is already active under-the-hood. Redirecting to home.");
+                    Toast.makeText(DeviceDiscoveryActivity.this, "P2P Network is already connected. Returning to home.", Toast.LENGTH_SHORT).show();
+                    finish();
+                } else {
+                    Toast.makeText(DeviceDiscoveryActivity.this, "Failed connecting. Reason: " + reason, Toast.LENGTH_SHORT).show();
+                }
+            }
+        });
     }
 
     @Override
@@ -153,6 +193,7 @@ public class DeviceDiscoveryActivity extends AppCompatActivity implements
 
     @Override
     public void onPeersChanged(List<WifiP2pDevice> peers) {
+        if (isConnecting) return; // Ignore peer updates while actively connecting
         WifeLogger.log(TAG, "onPeersChanged() callback triggered. Discovered peers count: " + peers.size());
         binding.pbDiscoveryProgress.setVisibility(View.GONE);
         peerList.clear();
@@ -165,10 +206,20 @@ public class DeviceDiscoveryActivity extends AppCompatActivity implements
         boolean groupFormed = info != null && info.groupFormed;
         WifeLogger.log(TAG, "onConnectionChanged() callback triggered. Group Formed Status: " + groupFormed);
         if (groupFormed) {
+            isConnecting = false;
             Toast.makeText(this, "P2P Network Group Formed successfully!", Toast.LENGTH_SHORT).show();
-            WifeLogger.log(TAG, "Wi-Fi P2P Group formed successfully. Terminating DeviceDiscoveryActivity and returning to main dashboard.");
+            WifeLogger.log(TAG, "Wi-Fi P2P Group formed successfully. Stopping active background discovery scans.");
+            
+            // Stop ongoing discovery on successful link establishment to prevent interface resets
+            wifiDirectManager.stopPeerDiscovery();
+            
+            WifeLogger.log(TAG, "Terminating DeviceDiscoveryActivity and returning to main dashboard.");
             finish(); // Go back to Home Dashboard once connected, where detailed status will show
         } else {
+            isConnecting = false;
+            binding.btnStartDiscovery.setEnabled(true);
+            binding.rvDiscoveredDevices.setEnabled(true);
+            
             // Symmetrical State Clear: Reset local peer tracking lists when connection is not formed
             WifeLogger.log(TAG, "Connection lost or not formed in discovery view. Resetting local peer lists.");
             peerList.clear();
