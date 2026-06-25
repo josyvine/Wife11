@@ -9,6 +9,7 @@ import android.content.Intent;
 import android.content.pm.ServiceInfo;
 import android.net.Uri;
 import android.os.Build;
+import android.os.Environment;
 import android.os.IBinder;
 import android.util.Log;
 
@@ -28,6 +29,10 @@ public class FileTransferForegroundService extends Service {
     public static volatile boolean isPaused = false;
     public static volatile boolean isCancelled = false;
     public static volatile long lastPosition = 0;
+
+    // System IPC Throttling variables (Rule 1 Fix: ANR Prevention)
+    private static final long NOTIFICATION_THROTTLE_MS = 2000;
+    private static volatile long lastNotificationTime = 0;
 
     @Override
     public void onCreate() {
@@ -50,15 +55,14 @@ public class FileTransferForegroundService extends Service {
         if (action != null) {
             switch (action) {
                 case Constants.ACTION_START_TRANSFER:
-                    // Reset global transaction flags for a fresh start
                     isCancelled = false;
                     isPaused = false;
                     lastPosition = 0;
+                    lastNotificationTime = 0; // Reset throttling mark
 
                     boolean isSender = intent.getBooleanExtra("IS_SENDER", false);
                     WifeLogger.log(TAG, "ACTION_START_TRANSFER initiated. Transfer Role: " + (isSender ? "Sender" : "Receiver"));
 
-                    // Elevate service to Foreground using DATA_SYNC constraints
                     Notification notification = buildProgressNotification("Initializing transfer stream...", 0, true);
                     if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
                         startForeground(NOTIF_ID, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC);
@@ -67,7 +71,6 @@ public class FileTransferForegroundService extends Service {
                     }
 
                     if (isSender) {
-                        // Extract persistent queue details
                         ArrayList<String> uriStrings = intent.getStringArrayListExtra("URI_LIST");
                         ArrayList<String> fileNames = intent.getStringArrayListExtra("FILE_NAMES");
                         long[] fileSizes = intent.getLongArrayExtra("FILE_SIZES");
@@ -85,24 +88,27 @@ public class FileTransferForegroundService extends Service {
                             stopSelf();
                         }
                     } else {
-                        // Bind server socket channel receiver loop
                         WifeLogger.log(TAG, "Spawning ServerSocketChannel persistent receiver thread.");
                         FileReceiver.startServer(this);
                     }
                     break;
 
                 case "UPDATE_NOTIF":
-                    // Symmetrical safeguard: If the transfer session has already finished or been 
-                    // cancelled, immediately stop the service and ignore delayed progress notifications.
                     if (isCancelled) {
                         WifeLogger.log(TAG, "UPDATE_NOTIF ignored: Transfer session is inactive. Stopping service.");
                         stopSelf();
                         break;
                     }
-                    // Symmetrical update block mapping to FileSender and FileReceiver stream notifications
+
                     String notifText = intent.getStringExtra("NOTIF_TEXT");
                     int progressValue = intent.getIntExtra("PROGRESS", 0);
-                    updateNotification(notifText, progressValue, false);
+
+                    // Throttling IPC: Enforces a maximum rate of 1 IPC transaction every 2 seconds to prevent ANR system freezes (Rule 1 Fix)
+                    long currentTime = System.currentTimeMillis();
+                    if (currentTime - lastNotificationTime >= NOTIFICATION_THROTTLE_MS) {
+                        updateNotification(notifText, progressValue, false);
+                        lastNotificationTime = currentTime;
+                    }
                     break;
 
                 case Constants.ACTION_PAUSE_TRANSFER:
@@ -128,7 +134,6 @@ public class FileTransferForegroundService extends Service {
                         pauseLock.notifyAll();
                     }
 
-                    // Symmetrical broadcast update to force UI closure in FileTransferActivity (Glitch 2 Fix)
                     Intent cancelIntent = new Intent(Constants.ACTION_TRANSFER_ERROR);
                     cancelIntent.putExtra(Constants.EXTRA_ERROR_MESSAGE, "Transfer cancelled by user.");
                     androidx.localbroadcastmanager.content.LocalBroadcastManager.getInstance(this).sendBroadcast(cancelIntent);
@@ -194,29 +199,38 @@ public class FileTransferForegroundService extends Service {
         }
     }
 
+    private File getBackupDirectory() {
+        File rootDir;
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            rootDir = new File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS), "wife shared/backups");
+        } else {
+            rootDir = new File(Environment.getExternalStorageDirectory(), "wife shared/backups");
+        }
+        if (!rootDir.exists()) {
+            rootDir.mkdirs();
+        }
+        return rootDir;
+    }
+
     @Override
     public void onDestroy() {
         WifeLogger.log(TAG, "onDestroy() invoked. Tearing down file transfer service and cleaning resources.");
         
-        // Symmetrical cleanup: Force-remove the foreground status
         stopForeground(true);
 
-        // Symmetrical dismissal: Explicitly dismiss standard ongoing notifications from status bar tray
         NotificationManager manager = (NotificationManager) getSystemService(Context.NOTIFICATION_SERVICE);
         if (manager != null) {
             manager.cancel(NOTIF_ID);
         }
 
-        // 1. Trigger cancellation flag to break background loop execution
         isCancelled = true;
         isPaused = false;
 
-        // 2. Unblock any threads currently suspended on the pauseLock monitor
         synchronized (pauseLock) {
             pauseLock.notifyAll();
         }
 
-        // 3. Force-purge any temporary cache files from previous or aborted transfers
+        // 1. Force-purge any temporary cache files from internal directory
         File cacheDir = getCacheDir();
         if (cacheDir != null && cacheDir.exists()) {
             File[] files = cacheDir.listFiles();
@@ -228,6 +242,24 @@ public class FileTransferForegroundService extends Service {
                     }
                 }
             }
+        }
+
+        // 2. Force-purge any abandoned parallel parts inside the public backups folder (Rule 2 Clean Fix)
+        try {
+            File backupDir = getBackupDirectory();
+            if (backupDir.exists()) {
+                File[] files = backupDir.listFiles();
+                if (files != null) {
+                    for (File f : files) {
+                        if (f.getName().startsWith("temp_send_") || f.getName().startsWith("temp_recv_") || f.getName().startsWith("chunk_") || f.getName().startsWith("temp_chunk_")) {
+                            boolean deleted = f.delete();
+                            WifeLogger.log(TAG, "Purged temporary backups file during destroy: " + f.getName() + " -> " + deleted);
+                        }
+                    }
+                }
+            }
+        } catch (Exception e) {
+            WifeLogger.log(TAG, "Failed executing public backups purge during destroy: " + e.getMessage());
         }
 
         super.onDestroy();
