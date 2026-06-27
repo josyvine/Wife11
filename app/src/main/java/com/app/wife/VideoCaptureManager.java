@@ -186,7 +186,8 @@ public class VideoCaptureManager {
         byte[] jpegBytes;
         try (ByteArrayOutputStream out = new ByteArrayOutputStream()) {
             YuvImage yuvImage = new YuvImage(nv21, ImageFormat.NV21, width, height, null);
-            yuvImage.compressToJpeg(new Rect(0, 0, width, height), 70, out);
+            // Lowered compression quality to 45 to minimize initial raw output size
+            yuvImage.compressToJpeg(new Rect(0, 0, width, height), 45, out);
             jpegBytes = out.toByteArray();
         } catch (Exception e) {
             Log.e(TAG, "Nv21 compression to JPEG failed: " + e.getMessage());
@@ -195,7 +196,7 @@ public class VideoCaptureManager {
         }
 
         // Apply native adjustments: Rotate upright and horizontally flip if front camera is active
-        if (jpegBytes != null && (rotationDegrees != 0 || lensFacing == CameraSelector.LENS_FACING_FRONT)) {
+        if (jpegBytes != null) {
             try {
                 Bitmap rawBitmap = BitmapFactory.decodeByteArray(jpegBytes, 0, jpegBytes.length);
                 if (rawBitmap != null) {
@@ -210,6 +211,21 @@ public class VideoCaptureManager {
                     if (lensFacing == CameraSelector.LENS_FACING_FRONT) {
                         matrix.postScale(-1f, 1f);
                     }
+
+                    // 3. Strict Downscaling Enforcement: Ensure target dimensions never exceed 320x240 boundaries
+                    int targetWidth = 320;
+                    int targetHeight = 240;
+                    if (rotationDegrees == 90 || rotationDegrees == 270) {
+                        targetWidth = 240;
+                        targetHeight = 320;
+                    }
+
+                    float scaleWidth = ((float) targetWidth) / rawBitmap.getWidth();
+                    float scaleHeight = ((float) targetHeight) / rawBitmap.getHeight();
+                    float scale = Math.min(scaleWidth, scaleHeight);
+                    if (scale < 1.0f) {
+                        matrix.postScale(scale, scale);
+                    }
                     
                     Bitmap rotatedBitmap = Bitmap.createBitmap(rawBitmap, 0, 0, rawBitmap.getWidth(), rawBitmap.getHeight(), matrix, true);
                     
@@ -218,7 +234,8 @@ public class VideoCaptureManager {
                     }
                     
                     try (ByteArrayOutputStream rotatedOut = new ByteArrayOutputStream()) {
-                        rotatedBitmap.compress(Bitmap.CompressFormat.JPEG, 70, rotatedOut);
+                        // Compress processed downscaled output at 45 quality for network safety
+                        rotatedBitmap.compress(Bitmap.CompressFormat.JPEG, 45, rotatedOut);
                         byte[] rotatedBytes = rotatedOut.toByteArray();
                         rotatedBitmap.recycle();
                         return rotatedBytes;
