@@ -247,7 +247,7 @@ public class FileTransferForegroundService extends Service {
     @Override
     public void onDestroy() {
         WifeLogger.log(TAG, "onDestroy() invoked. Tearing down file transfer service and cleaning resources.");
-        
+
         stopForeground(true);
 
         NotificationManager manager = (NotificationManager) getSystemService(Context.NOTIFICATION_SERVICE);
@@ -276,9 +276,14 @@ public class FileTransferForegroundService extends Service {
             File[] files = cacheDir.listFiles();
             if (files != null) {
                 for (File f : files) {
-                    if (f.getName().startsWith("temp_send_") || f.getName().startsWith("temp_recv_") || f.getName().startsWith("chunk_") || f.getName().startsWith("temp_chunk_")) {
+                    String name = f.getName();
+                    boolean isTempStream = name.startsWith("temp_send_") || name.startsWith("temp_recv_");
+                    boolean isChunkPart = name.startsWith("chunk_") || name.startsWith("temp_chunk_");
+
+                    // FIXED: Symmetrical check prevents deletion of parallel chunks belonging to other active file queues
+                    if (isTempStream || (isCancelled && isChunkPart)) {
                         boolean deleted = f.delete();
-                        WifeLogger.log(TAG, "Purged temporary cache file during destroy: " + f.getName() + " -> " + deleted);
+                        WifeLogger.log(TAG, "Purged temporary cache file during destroy: " + name + " -> " + deleted);
                     }
                 }
             }
@@ -291,9 +296,14 @@ public class FileTransferForegroundService extends Service {
                 File[] files = backupDir.listFiles();
                 if (files != null) {
                     for (File f : files) {
-                        if (f.getName().startsWith("temp_send_") || f.getName().startsWith("temp_recv_") || f.getName().startsWith("chunk_") || f.getName().startsWith("temp_chunk_")) {
+                        String name = f.getName();
+                        boolean isTempStream = name.startsWith("temp_send_") || name.startsWith("temp_recv_");
+                        boolean isChunkPart = name.startsWith("chunk_") || name.startsWith("temp_chunk_");
+
+                        // FIXED: Symmetrical check prevents deletion of parallel chunks belonging to other active file queues
+                        if (isTempStream || (isCancelled && isChunkPart)) {
                             boolean deleted = f.delete();
-                            WifeLogger.log(TAG, "Purged temporary backups file during destroy: " + f.getName() + " -> " + deleted);
+                            WifeLogger.log(TAG, "Purged temporary backups file during destroy: " + name + " -> " + deleted);
                         }
                     }
                 }
