@@ -142,7 +142,7 @@ public class FileSender {
     }
 
     /**
-     * Sends large files using parallel sockets and dynamic 20MB chunks in a throttled thread pool.
+     * Sends large files using parallel sockets and dynamic 20MB chunks in a throttled sliding window queue.
      * Saves files to public external storage backups to prevent ENOSPC storage exhaustion.
      */
     private void sendLargeFileInParallel(Uri fileUri, String fileName, long fileSize, String peerIp, int fileIndex) throws Exception {
@@ -150,102 +150,57 @@ public class FileSender {
         final int totalChunks = (int) Math.ceil((double) fileSize / CHUNK_SIZE);
         WifeLogger.log(TAG, "Parallel chunks metadata calculated. Total chunks to build: " + totalChunks);
 
-        // Fixed concurrency limit of 3 to avoid high native allocation thrashing
-        ExecutorService chunkExecutor = Executors.newFixedThreadPool(3);
+        // Control loop executing chunks sequentially in paged batches of 3 to avoid I/O thrashing
+        final int WINDOW_SIZE = 3;
         final List<Throwable> chunkExceptions = Collections.synchronizedList(new ArrayList<>());
         AtomicLong totalBytesSentCombined = new AtomicLong(0);
-        final long lastNotificationTime = System.currentTimeMillis();
 
         File backupDir = getBackupDirectory();
 
-        for (int chunkIdx = 0; chunkIdx < totalChunks; chunkIdx++) {
-            final int finalChunkIdx = chunkIdx;
-            chunkExecutor.execute(() -> {
-                if (FileTransferForegroundService.isCancelled || !chunkExceptions.isEmpty()) return;
+        for (int batchStart = 0; batchStart < totalChunks; batchStart += WINDOW_SIZE) {
+            if (FileTransferForegroundService.isCancelled || !chunkExceptions.isEmpty()) {
+                break;
+            }
 
-                File tempChunkFile = new File(backupDir, "temp_send_chunk_" + fileId + "_" + finalChunkIdx + ".lz4");
-                long startOffset = (long) finalChunkIdx * CHUNK_SIZE;
-                long rawChunkSize = Math.min(CHUNK_SIZE, fileSize - startOffset);
+            int batchEnd = Math.min(batchStart + WINDOW_SIZE, totalChunks);
+            int activeBatchCount = batchEnd - batchStart;
+            WifeLogger.log(TAG, "Processing Sliding Window Batch Chunks: [" + batchStart + " to " + (batchEnd - 1) + "]");
 
-                // 128KB buffer streams wrap raw file system content and output endpoints
-                try {
-                    try (InputStream is = context.getContentResolver().openInputStream(fileUri);
-                         BufferedInputStream bis = new BufferedInputStream(is, 128 * 1024);
-                         FileOutputStream fos = new FileOutputStream(tempChunkFile);
-                         BufferedOutputStream bos = new BufferedOutputStream(fos, 128 * 1024);
-                         net.jpountz.lz4.LZ4FrameOutputStream lz4Out = new net.jpountz.lz4.LZ4FrameOutputStream(bos, net.jpountz.lz4.LZ4FrameOutputStream.BLOCKSIZE.SIZE_256KB)) {
+            java.util.concurrent.CountDownLatch latch = new java.util.concurrent.CountDownLatch(activeBatchCount);
+            ExecutorService batchExecutor = Executors.newFixedThreadPool(activeBatchCount);
 
-                        if (is == null) throw new IOException("Failed opening content URI stream descriptor.");
+            for (int chunkIdx = batchStart; chunkIdx < batchEnd; chunkIdx++) {
+                final int finalChunkIdx = chunkIdx;
+                batchExecutor.execute(() -> {
+                    try {
+                        if (FileTransferForegroundService.isCancelled || !chunkExceptions.isEmpty()) return;
 
-                        // Fast stream skip offset pointer progression
-                        long skipped = 0;
-                        while (skipped < startOffset) {
-                            long skipRead = bis.skip(startOffset - skipped);
-                            if (skipRead <= 0) break;
-                            skipped += skipRead;
-                        }
+                        File tempChunkFile = new File(backupDir, "temp_send_chunk_" + fileId + "_" + finalChunkIdx + ".lz4");
+                        long startOffset = (long) finalChunkIdx * CHUNK_SIZE;
+                        long rawChunkSize = Math.min(CHUNK_SIZE, fileSize - startOffset);
 
-                        byte[] buffer = new byte[65536]; // Optimized 64KB block buffer
-                        long bytesReadTotal = 0;
-                        int read;
+                        // 128KB buffer streams wrap raw file system content and output endpoints
+                        try (InputStream is = context.getContentResolver().openInputStream(fileUri);
+                             BufferedInputStream bis = new BufferedInputStream(is, 128 * 1024);
+                             FileOutputStream fos = new FileOutputStream(tempChunkFile);
+                             BufferedOutputStream bos = new BufferedOutputStream(fos, 128 * 1024);
+                             net.jpountz.lz4.LZ4FrameOutputStream lz4Out = new net.jpountz.lz4.LZ4FrameOutputStream(bos, net.jpountz.lz4.LZ4FrameOutputStream.BLOCKSIZE.SIZE_256KB)) {
 
-                        while (bytesReadTotal < rawChunkSize && (read = bis.read(buffer, 0, (int) Math.min(buffer.length, rawChunkSize - bytesReadTotal))) != -1) {
-                            if (FileTransferForegroundService.isCancelled || !chunkExceptions.isEmpty()) break;
+                            if (is == null) throw new IOException("Failed opening content URI stream descriptor.");
 
-                            synchronized (FileTransferForegroundService.pauseLock) {
-                                while (FileTransferForegroundService.isPaused && !FileTransferForegroundService.isCancelled) {
-                                    try {
-                                        FileTransferForegroundService.pauseLock.wait();
-                                    } catch (InterruptedException ignored) {}
-                                }
+                            // Fast stream skip offset pointer progression
+                            long skipped = 0;
+                            while (skipped < startOffset) {
+                                long skipRead = bis.skip(startOffset - skipped);
+                                if (skipRead <= 0) break;
+                                skipped += skipRead;
                             }
 
-                            lz4Out.write(buffer, 0, read);
-                            bytesReadTotal += read;
-                        }
-                        lz4Out.flush();
-                    }
+                            byte[] buffer = new byte[65536]; // Optimized 64KB block buffer
+                            long bytesReadTotal = 0;
+                            int read;
 
-                    long compressedChunkSize = tempChunkFile.length();
-                    WifeLogger.log(TAG, "Chunk [" + finalChunkIdx + "] compression finalized. Compressed: " + compressedChunkSize + " bytes.");
-
-                    if (FileTransferForegroundService.isCancelled || !chunkExceptions.isEmpty()) return;
-
-                    try (SocketChannel chunkChannel = SocketChannel.open()) {
-                        chunkChannel.connect(new InetSocketAddress(peerIp, Constants.OFF_PORT_FILE));
-                        chunkChannel.configureBlocking(true);
-                        OutputStream os = chunkChannel.socket().getOutputStream();
-
-                        JsonObject chunkMeta = new JsonObject();
-                        chunkMeta.addProperty("type", "chunk");
-                        chunkMeta.addProperty("fileId", fileId);
-                        chunkMeta.addProperty("name", fileName);
-                        chunkMeta.addProperty("chunkIndex", finalChunkIdx);
-                        chunkMeta.addProperty("totalChunks", totalChunks);
-                        chunkMeta.addProperty("size", fileSize);
-                        chunkMeta.addProperty("compressedSize", compressedChunkSize);
-
-                        byte[] metaBytes = chunkMeta.toString().getBytes(StandardCharsets.UTF_8);
-                        byte[] lenBytes = new byte[4];
-                        lenBytes[0] = (byte) ((metaBytes.length >> 24) & 0xFF);
-                        lenBytes[1] = (byte) ((metaBytes.length >> 16) & 0xFF);
-                        lenBytes[2] = (byte) ((metaBytes.length >> 8) & 0xFF);
-                        lenBytes[3] = (byte) (metaBytes.length & 0xFF);
-
-                        os.write(lenBytes);
-                        os.write(metaBytes);
-                        os.flush();
-
-                        try (FileInputStream fis = new FileInputStream(tempChunkFile);
-                             BufferedInputStream bisFile = new BufferedInputStream(fis, 128 * 1024)) {
-                            byte[] buffer = new byte[16384];
-                            int len;
-                            long bytesSentForThisChunk = 0;
-                            long speedPeriodBytesSent = 0;
-                            long speedPeriodStartTime = System.currentTimeMillis();
-                            double currentSpeed = 0.0;
-
-                            while ((len = bisFile.read(buffer)) != -1) {
+                            while (bytesReadTotal < rawChunkSize && (read = bis.read(buffer, 0, (int) Math.min(buffer.length, rawChunkSize - bytesReadTotal))) != -1) {
                                 if (FileTransferForegroundService.isCancelled || !chunkExceptions.isEmpty()) break;
 
                                 synchronized (FileTransferForegroundService.pauseLock) {
@@ -256,50 +211,115 @@ public class FileSender {
                                     }
                                 }
 
-                                os.write(buffer, 0, len);
-                                bytesSentForThisChunk += len;
-                                speedPeriodBytesSent += len;
-                                long totalSoFar = totalBytesSentCombined.addAndGet(len);
-
-                                long currentTime = System.currentTimeMillis();
-                                long timeDiff = currentTime - speedPeriodStartTime;
-                                if (timeDiff >= 1000) {
-                                    currentSpeed = ((double) speedPeriodBytesSent / (1024.0 * 1024.0)) / ((double) timeDiff / 1000.0);
-                                    speedPeriodBytesSent = 0;
-                                    speedPeriodStartTime = currentTime;
-                                }
-
-                                long now = System.currentTimeMillis();
-                                if (now - lastNotificationTime >= 500) {
-                                    int percent = (int) ((totalSoFar * 100) / fileSize);
-                                    // Symmetrical change: Pass compressedChunkSize instead of rawChunkSize to let the progress bar hit 100%
-                                    broadcastChunkProgress(fileName, totalSoFar, fileSize, percent, fileIndex, currentSpeed, finalChunkIdx, bytesSentForThisChunk, compressedChunkSize);
-                                }
+                                lz4Out.write(buffer, 0, read);
+                                bytesReadTotal += read;
                             }
-                            os.flush();
+                            lz4Out.flush();
                         }
 
-                        // Symmetrical solution: Send final 100% chunk progress broadcast on complete transfer loop exit (Glitch Fix)
-                        int finalPercent = (int) ((totalBytesSentCombined.get() * 100) / fileSize);
-                        broadcastChunkProgress(fileName, totalBytesSentCombined.get(), fileSize, finalPercent, fileIndex, 0.0, finalChunkIdx, compressedChunkSize, compressedChunkSize);
+                        long compressedChunkSize = tempChunkFile.length();
+                        WifeLogger.log(TAG, "Chunk [" + finalChunkIdx + "] compression finalized. Compressed: " + compressedChunkSize + " bytes.");
 
-                        chunkChannel.socket().shutdownOutput();
-                        Thread.sleep(500); // 500ms grace window to prevent connection truncation freezes
+                        if (FileTransferForegroundService.isCancelled || !chunkExceptions.isEmpty()) return;
+
+                        try (SocketChannel chunkChannel = SocketChannel.open()) {
+                            chunkChannel.connect(new InetSocketAddress(peerIp, Constants.OFF_PORT_FILE));
+                            chunkChannel.configureBlocking(true);
+                            OutputStream os = chunkChannel.socket().getOutputStream();
+
+                            JsonObject chunkMeta = new JsonObject();
+                            chunkMeta.addProperty("type", "chunk");
+                            chunkMeta.addProperty("fileId", fileId);
+                            chunkMeta.addProperty("name", fileName);
+                            chunkMeta.addProperty("chunkIndex", finalChunkIdx);
+                            chunkMeta.addProperty("totalChunks", totalChunks);
+                            chunkMeta.addProperty("size", fileSize);
+                            chunkMeta.addProperty("compressedSize", compressedChunkSize);
+
+                            byte[] metaBytes = chunkMeta.toString().getBytes(StandardCharsets.UTF_8);
+                            byte[] lenBytes = new byte[4];
+                            lenBytes[0] = (byte) ((metaBytes.length >> 24) & 0xFF);
+                            lenBytes[1] = (byte) ((metaBytes.length >> 16) & 0xFF);
+                            lenBytes[2] = (byte) ((metaBytes.length >> 8) & 0xFF);
+                            lenBytes[3] = (byte) (metaBytes.length & 0xFF);
+
+                            os.write(lenBytes);
+                            os.write(metaBytes);
+                            os.flush();
+
+                            try (FileInputStream fis = new FileInputStream(tempChunkFile);
+                                 BufferedInputStream bisFile = new BufferedInputStream(fis, 128 * 1024)) {
+                                byte[] buffer = new byte[16384];
+                                int len;
+                                long bytesSentForThisChunk = 0;
+                                long speedPeriodBytesSent = 0;
+                                long speedPeriodStartTime = System.currentTimeMillis();
+                                double currentSpeed = 0.0;
+                                long localLastNotificationTime = System.currentTimeMillis();
+
+                                while ((len = bisFile.read(buffer)) != -1) {
+                                    if (FileTransferForegroundService.isCancelled || !chunkExceptions.isEmpty()) break;
+
+                                    synchronized (FileTransferForegroundService.pauseLock) {
+                                        while (FileTransferForegroundService.isPaused && !FileTransferForegroundService.isCancelled) {
+                                            try {
+                                                FileTransferForegroundService.pauseLock.wait();
+                                            } catch (InterruptedException ignored) {}
+                                        }
+                                    }
+
+                                    os.write(buffer, 0, len);
+                                    bytesSentForThisChunk += len;
+                                    speedPeriodBytesSent += len;
+                                    long totalSoFar = totalBytesSentCombined.addAndGet(len);
+
+                                    long currentTime = System.currentTimeMillis();
+                                    long timeDiff = currentTime - speedPeriodStartTime;
+                                    if (timeDiff >= 1000) {
+                                        currentSpeed = ((double) speedPeriodBytesSent / (1024.0 * 1024.0)) / ((double) timeDiff / 1000.0);
+                                        speedPeriodBytesSent = 0;
+                                        speedPeriodStartTime = currentTime;
+                                    }
+
+                                    long now = System.currentTimeMillis();
+                                    // FIXED: Mutably update localLastNotificationTime to strictly enforce the throttle window
+                                    if (now - localLastNotificationTime >= 1000) {
+                                        int percent = (int) ((totalSoFar * 100) / fileSize);
+                                        broadcastChunkProgress(fileName, totalSoFar, fileSize, percent, fileIndex, currentSpeed, finalChunkIdx, bytesSentForThisChunk, compressedChunkSize);
+                                        localLastNotificationTime = now;
+                                    }
+                                }
+                                os.flush();
+                            }
+
+                            int finalPercent = (int) ((totalBytesSentCombined.get() * 100) / fileSize);
+                            broadcastChunkProgress(fileName, totalBytesSentCombined.get(), fileSize, finalPercent, fileIndex, 0.0, finalChunkIdx, compressedChunkSize, compressedChunkSize);
+
+                            chunkChannel.socket().shutdownOutput();
+                            Thread.sleep(500); // 500ms grace window to prevent connection truncation freezes
+                        }
+                    } catch (Exception e) {
+                        WifeLogger.log(TAG, "Failed parallel chunk delivery for index " + finalChunkIdx + ": " + e.getMessage());
+                        chunkExceptions.add(e);
+                    } finally {
+                        latch.countDown();
                     }
-                } catch (Exception e) {
-                    WifeLogger.log(TAG, "Failed parallel chunk delivery for index " + finalChunkIdx + ": " + e.getMessage());
-                    chunkExceptions.add(e);
-                } finally {
-                    if (tempChunkFile.exists()) {
-                        boolean deleted = tempChunkFile.delete();
-                        WifeLogger.log(TAG, "Purged temporary send chunk file: " + tempChunkFile.getName() + " -> " + deleted);
-                    }
+                });
+            }
+
+            // Sync block wait to finalize the active window batch before proceeding to subsequent tasks
+            latch.await();
+            batchExecutor.shutdown();
+            batchExecutor.awaitTermination(5, TimeUnit.MINUTES);
+
+            // Symmetrical cleanup: Purge physical chunk LZ4 cache files immediately after each batch is finalized
+            for (int chunkIdx = batchStart; chunkIdx < batchEnd; chunkIdx++) {
+                File tempChunkFile = new File(backupDir, "temp_send_chunk_" + fileId + "_" + chunkIdx + ".lz4");
+                if (tempChunkFile.exists()) {
+                    tempChunkFile.delete();
                 }
-            });
+            }
         }
-
-        chunkExecutor.shutdown();
-        chunkExecutor.awaitTermination(1, TimeUnit.HOURS);
 
         if (!chunkExceptions.isEmpty()) {
             throw new IOException("Failed parallel chunk delivery: " + chunkExceptions.get(0).getMessage());
@@ -341,7 +361,7 @@ public class FileSender {
                     byte[] buffer = new byte[65536];
                     int read;
                     long bytesReadTotal = 0;
-                    long lastProgressUpdate = 0;
+                    long lastProgressUpdate = System.currentTimeMillis();
 
                     while ((read = bis.read(buffer)) != -1) {
                         if (FileTransferForegroundService.isCancelled) break;
@@ -358,7 +378,8 @@ public class FileSender {
                         bytesReadTotal += read;
 
                         long currentTime = System.currentTimeMillis();
-                        if (currentTime - lastProgressUpdate >= 500) {
+                        // FIXED: Correctly reassign lastProgressUpdate inside loop to throttle compression updates
+                        if (currentTime - lastProgressUpdate >= 1000) {
                             int percent = (fileSize > 0) ? (int) ((bytesReadTotal * 100) / fileSize) : 0;
                             broadcastProgress("Compressing: " + fileName, bytesReadTotal, fileSize, percent, fileIndex, 0.0);
                             lastProgressUpdate = currentTime;
@@ -429,7 +450,8 @@ public class FileSender {
                             speedPeriodStartTime = currentTime;
                         }
 
-                        if (currentTime - lastNotificationUpdateTime >= 500) {
+                        // FIXED: Correctly reassign lastNotificationUpdateTime inside loop to throttle network updates
+                        if (currentTime - lastNotificationUpdateTime >= 1000) {
                             int percent = (int) ((totalBytesSent * 100) / compressedSize);
                             broadcastProgress(fileName, totalBytesSent, compressedSize, percent, fileIndex, currentSpeed);
                             lastNotificationUpdateTime = currentTime;
