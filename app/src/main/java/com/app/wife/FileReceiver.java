@@ -52,6 +52,9 @@ public class FileReceiver implements Runnable {
     // Thread-safe map tracking completed chunks per active transaction
     private static final ConcurrentHashMap<String, AtomicInteger> activeTransfers = new ConcurrentHashMap<>();
 
+    // Thread-safe map tracking global last progress update timestamps per file to prevent multi-threaded IPC floods
+    private static final ConcurrentHashMap<String, Long> lastBroadcastTimes = new ConcurrentHashMap<>();
+
     // Managed fixed-size thread pool to execute socket receivers concurrently without system thread exhaustion
     private static final ExecutorService receiverExecutor = Executors.newFixedThreadPool(5);
 
@@ -266,7 +269,7 @@ public class FileReceiver implements Runnable {
                          BufferedOutputStream bos = new BufferedOutputStream(fos, 128 * 1024)) {
                         byte[] buffer = new byte[16384];
                         long totalBytesRead = 0;
-                        long lastNotifTime = 0;
+                        long lastNotifTime = System.currentTimeMillis();
                         while (totalBytesRead < compressedSize && !FileTransferForegroundService.isCancelled) {
                             int bytesToRead = (int) Math.min(buffer.length, compressedSize - totalBytesRead);
                             int read = proxyIn.read(buffer, 0, bytesToRead);
@@ -277,11 +280,10 @@ public class FileReceiver implements Runnable {
                             totalBytesRead += read;
 
                             long now = System.currentTimeMillis();
-                            if (now - lastNotifTime >= 500) {
+                            if (now - lastNotifTime >= 1000) {
                                 // Feed chunk progress updates relative to compressed segment size during transaction
                                 int globalCompleted = activeTransfers.getOrDefault(fileId, new AtomicInteger(0)).get();
                                 int globalPercent = (globalCompleted * 100) / totalChunks;
-                                // FIXED: Passed the chunk's local metrics totalBytesRead (transferred) and compressedSize (total) so the row hits 100%
                                 notifyChunkProgress(context, filename, globalPercent, globalCompleted * 20L * 1024L * 1024L + totalBytesRead, originalSize, fileIndex, 0.0, chunkIndex, totalBytesRead, compressedSize);
                                 lastNotifTime = now;
                             }
@@ -301,7 +303,6 @@ public class FileReceiver implements Runnable {
                         int completed = activeTransfers.get(fileId).incrementAndGet();
 
                         int percent = (completed * 100) / totalChunks;
-                        // FIXED: Set actual local progress parameters to compressedSize bounds for clean cleanup triggering
                         notifyChunkProgress(context, filename, percent, completed * 20L * 1024L * 1024L, originalSize, fileIndex, 0.0, chunkIndex, compressedSize, compressedSize);
 
                         if (completed == totalChunks) {
@@ -360,7 +361,7 @@ public class FileReceiver implements Runnable {
                                 speedPeriodStartTime = currentTime;
                             }
 
-                            if (currentTime - lastNotificationUpdateTime >= 500) {
+                            if (currentTime - lastNotificationUpdateTime >= 1000) {
                                 int percent = (int) ((totalBytesRead * 100) / compressedSize);
                                 notifyProgress(context, filename, percent, totalBytesRead, compressedSize, fileIndex, currentSpeed);
                                 lastNotificationUpdateTime = currentTime;
@@ -420,6 +421,7 @@ public class FileReceiver implements Runnable {
                     broadcastCompletion(context);
                     
                     activeTransfers.remove(fileId);
+                    lastBroadcastTimes.remove(filename);
                 } catch (Exception e) {
                     WifeLogger.log(TAG, "Database log persistence failed after zero-copy merge: " + e.getMessage(), e);
                     broadcastError(context, e.getMessage());
@@ -503,58 +505,74 @@ public class FileReceiver implements Runnable {
     // --- UI/Notification Broadcast dispatchers ---
 
     private static void notifyProgress(Context context, final String filename, final int percent, long transferred, long total, int fileIndex, double speed) {
-        new Handler(Looper.getMainLooper()).post(() -> {
-            synchronized (FileReceiver.class) {
-                for (FileReceiveListener l : listeners) {
-                    l.onProgress(filename, percent);
+        long now = System.currentTimeMillis();
+        Long lastTime = lastBroadcastTimes.get(filename);
+        
+        // FIXED: Enforce a strict 1-second global rate limit to protect main thread Looper during parallel receives
+        if (lastTime == null || (now - lastTime >= 1000)) {
+            lastBroadcastTimes.put(filename, now);
+
+            new Handler(Looper.getMainLooper()).post(() -> {
+                synchronized (FileReceiver.class) {
+                    for (FileReceiveListener l : listeners) {
+                        l.onProgress(filename, percent);
+                    }
                 }
-            }
-        });
+            });
 
-        Intent intent = new Intent(Constants.ACTION_TRANSFER_PROGRESS);
-        intent.putExtra(Constants.EXTRA_FILE_NAME, filename);
-        intent.putExtra(Constants.EXTRA_BYTES_TRANSFERRED, transferred);
-        intent.putExtra(Constants.EXTRA_TOTAL_BYTES, total);
-        intent.putExtra(Constants.EXTRA_FILE_INDEX, fileIndex);
-        intent.putExtra(Constants.EXTRA_TRANSFER_SPEED, speed);
-        intent.putExtra("IS_CHUNK", false);
-        LocalBroadcastManager.getInstance(context).sendBroadcast(intent);
+            Intent intent = new Intent(Constants.ACTION_TRANSFER_PROGRESS);
+            intent.putExtra(Constants.EXTRA_FILE_NAME, filename);
+            intent.putExtra(Constants.EXTRA_BYTES_TRANSFERRED, transferred);
+            intent.putExtra(Constants.EXTRA_TOTAL_BYTES, total);
+            intent.putExtra(Constants.EXTRA_FILE_INDEX, fileIndex);
+            intent.putExtra(Constants.EXTRA_TRANSFER_SPEED, speed);
+            intent.putExtra("IS_CHUNK", false);
+            LocalBroadcastManager.getInstance(context).sendBroadcast(intent);
 
-        String speedText = String.format(Locale.US, "%.1f MB/s", speed);
-        Intent serviceIntent = new Intent(context, FileTransferForegroundService.class);
-        serviceIntent.setAction("UPDATE_NOTIF");
-        serviceIntent.putExtra("NOTIF_TEXT", "Receiving " + filename + " (" + percent + "%) - " + speedText);
-        serviceIntent.putExtra("PROGRESS", percent);
-        context.startService(serviceIntent);
+            String speedText = String.format(Locale.US, "%.1f MB/s", speed);
+            Intent serviceIntent = new Intent(context, FileTransferForegroundService.class);
+            serviceIntent.setAction("UPDATE_NOTIF");
+            serviceIntent.putExtra("NOTIF_TEXT", "Receiving " + filename + " (" + percent + "%) - " + speedText);
+            serviceIntent.putExtra("PROGRESS", percent);
+            context.startService(serviceIntent);
+        }
     }
 
     private static void notifyChunkProgress(Context context, final String filename, final int percent, long transferred, long total, int fileIndex, double speed, int chunkIndex, long chunkTransferred, long chunkTotal) {
-        new Handler(Looper.getMainLooper()).post(() -> {
-            synchronized (FileReceiver.class) {
-                for (FileReceiveListener l : listeners) {
-                    l.onProgress(filename, percent);
+        long now = System.currentTimeMillis();
+        Long lastTime = lastBroadcastTimes.get(filename);
+
+        // FIXED: Enforce a strict 1-second global rate limit to protect main thread Looper during parallel chunk receives
+        if (lastTime == null || (now - lastTime >= 1000)) {
+            lastBroadcastTimes.put(filename, now);
+
+            new Handler(Looper.getMainLooper()).post(() -> {
+                synchronized (FileReceiver.class) {
+                    for (FileReceiveListener l : listeners) {
+                        l.onProgress(filename, percent);
+                    }
                 }
-            }
-        });
+            });
 
-        Intent intent = new Intent(Constants.ACTION_TRANSFER_PROGRESS);
-        intent.putExtra(Constants.EXTRA_FILE_NAME, filename);
-        intent.putExtra(Constants.EXTRA_BYTES_TRANSFERRED, transferred);
-        intent.putExtra(Constants.EXTRA_TOTAL_BYTES, total);
-        intent.putExtra(Constants.EXTRA_FILE_INDEX, fileIndex);
-        intent.putExtra(Constants.EXTRA_TRANSFER_SPEED, speed);
-        intent.putExtra("IS_CHUNK", true);
-        intent.putExtra("CHUNK_INDEX", chunkIndex);
-        intent.putExtra("CHUNK_BYTES_TRANSFERRED", chunkTransferred);
-        intent.putExtra("CHUNK_TOTAL_BYTES", chunkTotal);
-        LocalBroadcastManager.getInstance(context).sendBroadcast(intent);
+            Intent intent = new Intent(Constants.ACTION_TRANSFER_PROGRESS);
+            intent.putExtra(Constants.EXTRA_FILE_NAME, filename);
+            intent.putExtra(Constants.EXTRA_BYTES_TRANSFERRED, transferred);
+            intent.putExtra(Constants.EXTRA_TOTAL_BYTES, total);
+            intent.putExtra(Constants.EXTRA_FILE_INDEX, fileIndex);
+            intent.putExtra(Constants.EXTRA_TRANSFER_SPEED, speed);
+            intent.putExtra("IS_CHUNK", true);
+            intent.putExtra("CHUNK_INDEX", chunkIndex);
+            intent.putExtra("CHUNK_BYTES_TRANSFERRED", chunkTransferred);
+            intent.putExtra("CHUNK_TOTAL_BYTES", chunkTotal);
+            LocalBroadcastManager.getInstance(context).sendBroadcast(intent);
 
-        String speedText = String.format(Locale.US, "%.1f MB/s", speed);
-        Intent serviceIntent = new Intent(context, FileTransferForegroundService.class);
-        serviceIntent.setAction("UPDATE_NOTIF");
-        serviceIntent.putExtra("NOTIF_TEXT", "Receiving Chunk #" + (chunkIndex + 1) + " of " + filename + " (" + percent + "%) - " + speedText);
-        serviceIntent.putExtra("PROGRESS", percent);
-        context.startService(serviceIntent);
+            String speedText = String.format(Locale.US, "%.1f MB/s", speed);
+            Intent serviceIntent = new Intent(context, FileTransferForegroundService.class);
+            serviceIntent.setAction("UPDATE_NOTIF");
+            serviceIntent.putExtra("NOTIF_TEXT", "Receiving Chunk #" + (chunkIndex + 1) + " of " + filename + " (" + percent + "%) - " + speedText);
+            serviceIntent.putExtra("PROGRESS", percent);
+            context.startService(serviceIntent);
+        }
     }
 
     private static void notifyComplete(Context context, final String filename, final String path, int fileIndex) {
