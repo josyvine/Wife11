@@ -195,10 +195,14 @@ public class GroupVideoCallActivity extends AppCompatActivity implements
             private int targetFrameSize = -1;
 
             @Override
-            public void write(int b) throws IOException {}
+            public synchronized void write(int b) throws IOException {
+                // Route single byte writes through the multi-byte analyzer to prevent fragmentation stalls
+                byte[] singleByteBuf = new byte[]{(byte) b};
+                write(singleByteBuf, 0, 1);
+            }
 
             @Override
-            public void write(byte[] b, int off, int len) throws IOException {
+            public synchronized void write(byte[] b, int off, int len) throws IOException {
                 int offset = off;
                 int remaining = len;
 
