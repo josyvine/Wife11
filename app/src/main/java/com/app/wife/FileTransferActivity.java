@@ -23,7 +23,9 @@ import androidx.recyclerview.widget.LinearLayoutManager;
 import com.wife.app.databinding.ActivityFileTransferBinding;
 
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 
 public class FileTransferActivity extends AppCompatActivity implements 
         FileSender.FileTransferListener, 
@@ -36,6 +38,9 @@ public class FileTransferActivity extends AppCompatActivity implements
     private FileAdapter adapter;
     private final List<FileEntity> historyList = new ArrayList<>();
     private RoomDatabaseManager db;
+
+    // High-performance cache map to avoid recursive findViewWithTag tree traversals
+    private final Map<Integer, View> activeChunkViews = new HashMap<>();
 
     // Upgraded contract to select multiple files at once (Glitch 3 Fix)
     private final ActivityResultLauncher<String> filePickerLauncher = registerForActivityResult(
@@ -70,17 +75,18 @@ public class FileTransferActivity extends AppCompatActivity implements
 
                         // Symmetrical Cleanup logic: If chunk reaches completion, purge its row to prevent UI bloating
                         if (chunkPercent >= 100) {
-                            View chunkRow = binding.containerActiveChunks.findViewWithTag("chunk_" + chunkIndex);
+                            View chunkRow = activeChunkViews.remove(chunkIndex);
                             if (chunkRow != null) {
                                 binding.containerActiveChunks.removeView(chunkRow);
                             }
                         } else {
-                            // Dynamically inflate or retrieve progress row for the specific index
-                            View chunkRow = binding.containerActiveChunks.findViewWithTag("chunk_" + chunkIndex);
+                            // High-performance cache-based lookup instead of findViewWithTag tree traversal
+                            View chunkRow = activeChunkViews.get(chunkIndex);
                             if (chunkRow == null) {
                                 chunkRow = getLayoutInflater().inflate(R.layout.item_chunk_progress, binding.containerActiveChunks, false);
                                 chunkRow.setTag("chunk_" + chunkIndex);
                                 binding.containerActiveChunks.addView(chunkRow);
+                                activeChunkViews.put(chunkIndex, chunkRow);
                             }
 
                             TextView tvChunkLabel = chunkRow.findViewById(R.id.tvChunkLabel);
@@ -117,6 +123,7 @@ public class FileTransferActivity extends AppCompatActivity implements
                     } else {
                         // Sequential non-chunk legacy layout configuration
                         binding.containerActiveChunks.removeAllViews(); // Clean up dynamic rows
+                        activeChunkViews.clear();
 
                         if (FileTransferForegroundService.isPaused) {
                             binding.tvActiveFileName.setText("Paused: " + filename);
@@ -144,6 +151,7 @@ public class FileTransferActivity extends AppCompatActivity implements
                     Toast.makeText(FileTransferActivity.this, "Transfer completed successfully!", Toast.LENGTH_SHORT).show();
                     binding.layoutTransferProgress.setVisibility(View.GONE);
                     binding.containerActiveChunks.removeAllViews(); // Purge chunk rows
+                    activeChunkViews.clear();
                     loadHistory();
                     
                     stopService(new Intent(FileTransferActivity.this, FileTransferForegroundService.class));
@@ -158,6 +166,7 @@ public class FileTransferActivity extends AppCompatActivity implements
                     }
                     binding.layoutTransferProgress.setVisibility(View.GONE);
                     binding.containerActiveChunks.removeAllViews(); // Purge chunk rows
+                    activeChunkViews.clear();
                     loadHistory();
                     
                     stopService(new Intent(FileTransferActivity.this, FileTransferForegroundService.class));
@@ -253,6 +262,7 @@ public class FileTransferActivity extends AppCompatActivity implements
 
         binding.layoutTransferProgress.setVisibility(View.VISIBLE);
         binding.containerActiveChunks.removeAllViews(); // Fresh visual state setup
+        activeChunkViews.clear();
 
         if (uris.size() == 1) {
             binding.tvActiveFileName.setText("Uploading: " + fileNames.get(0));
