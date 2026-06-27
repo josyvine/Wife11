@@ -110,6 +110,10 @@ public class FileReceiver implements Runnable {
                         clientChannel = serverChannel.accept();
                         clientChannel.configureBlocking(true);
 
+                        // High-Speed Socket Configurations on accepted client socket
+                        clientChannel.socket().setTcpNoDelay(true);
+                        clientChannel.socket().setReceiveBufferSize(1024 * 1024); // 1MB input buffer
+
                         final SocketChannel finalChannel = clientChannel;
                         
                         // Hand off accepted connection to the executor pool to support up to 5 parallel workers safely
@@ -267,7 +271,7 @@ public class FileReceiver implements Runnable {
                 try {
                     try (FileOutputStream fos = new FileOutputStream(tempCompressedChunk);
                          BufferedOutputStream bos = new BufferedOutputStream(fos, 128 * 1024)) {
-                        byte[] buffer = new byte[16384];
+                        byte[] buffer = new byte[65536]; // Increased from 16KB to 64KB for high-speed reception
                         long totalBytesRead = 0;
                         long lastNotifTime = System.currentTimeMillis();
                         while (totalBytesRead < compressedSize && !FileTransferForegroundService.isCancelled) {
@@ -323,7 +327,7 @@ public class FileReceiver implements Runnable {
                 try {
                     try (FileOutputStream fos = new FileOutputStream(tempCompressedFile, resumePosition > 0);
                          BufferedOutputStream bos = new BufferedOutputStream(fos, 128 * 1024)) {
-                        byte[] buffer = new byte[16384];
+                        byte[] buffer = new byte[65536]; // Increased from 16KB to 64KB for high-speed reception
                         long totalBytesRead = resumePosition;
                         long lastNotificationUpdateTime = System.currentTimeMillis();
                         long speedPeriodBytesRead = 0;
@@ -356,7 +360,7 @@ public class FileReceiver implements Runnable {
                             long currentTime = System.currentTimeMillis();
                             long timeDiff = currentTime - speedPeriodStartTime;
                             if (timeDiff >= 1000) {
-                                currentSpeed = ((double) speedPeriodBytesRead / (1024.0 * 1024.0)) / ((double) timeDiff / 1000.0);
+                                currentSpeed = ((double) speedPeriodBytesSent / (1024.0 * 1024.0)) / ((double) timeDiff / 1000.0);
                                 speedPeriodBytesRead = 0;
                                 speedPeriodStartTime = currentTime;
                             }
@@ -508,8 +512,10 @@ public class FileReceiver implements Runnable {
         long now = System.currentTimeMillis();
         Long lastTime = lastBroadcastTimes.get(filename);
         
-        // FIXED: Enforce a strict 1-second global rate limit to protect main thread Looper during parallel receives
-        if (lastTime == null || (now - lastTime >= 1000)) {
+        // FIXED: Force-bypass the 1-second progress rate limit if the file is completely received (percent >= 100)
+        boolean isComplete = (transferred >= total || percent >= 100);
+
+        if (isComplete || lastTime == null || (now - lastTime >= 1000)) {
             lastBroadcastTimes.put(filename, now);
 
             new Handler(Looper.getMainLooper()).post(() -> {
@@ -542,8 +548,11 @@ public class FileReceiver implements Runnable {
         long now = System.currentTimeMillis();
         Long lastTime = lastBroadcastTimes.get(filename);
 
-        // FIXED: Enforce a strict 1-second global rate limit to protect main thread Looper during parallel chunk receives
-        if (lastTime == null || (now - lastTime >= 1000)) {
+        // FIXED: Force-bypass the 1-second progress rate limit if the chunk itself is completely received (chunkTransferred >= chunkTotal)
+        boolean isChunkComplete = (chunkTransferred >= chunkTotal);
+        boolean isFileComplete = (percent >= 100);
+
+        if (isChunkComplete || isFileComplete || lastTime == null || (now - lastTime >= 1000)) {
             lastBroadcastTimes.put(filename, now);
 
             new Handler(Looper.getMainLooper()).post(() -> {
