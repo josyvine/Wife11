@@ -223,6 +223,10 @@ public class FileSender {
                         if (FileTransferForegroundService.isCancelled || !chunkExceptions.isEmpty()) return;
 
                         try (SocketChannel chunkChannel = SocketChannel.open()) {
+                            // High-Speed Socket Configurations
+                            chunkChannel.socket().setTcpNoDelay(true);
+                            chunkChannel.socket().setSendBufferSize(1024 * 1024); // 1MB Output buffer
+                            
                             chunkChannel.connect(new InetSocketAddress(peerIp, Constants.OFF_PORT_FILE));
                             chunkChannel.configureBlocking(true);
                             OutputStream os = chunkChannel.socket().getOutputStream();
@@ -249,7 +253,7 @@ public class FileSender {
 
                             try (FileInputStream fis = new FileInputStream(tempChunkFile);
                                  BufferedInputStream bisFile = new BufferedInputStream(fis, 128 * 1024)) {
-                                byte[] buffer = new byte[16384];
+                                byte[] buffer = new byte[65536]; // Increased from 16KB to 64KB for faster socket I/O
                                 int len;
                                 long bytesSentForThisChunk = 0;
                                 long speedPeriodBytesSent = 0;
@@ -285,6 +289,7 @@ public class FileSender {
                                     // FIXED: Mutably update localLastNotificationTime to strictly enforce the throttle window
                                     if (now - localLastNotificationTime >= 1000) {
                                         int percent = (int) ((totalSoFar * 100) / fileSize);
+                                        // Symmetrical change: Pass compressedChunkSize instead of rawChunkSize to let the progress bar hit 100%
                                         broadcastChunkProgress(fileName, totalSoFar, fileSize, percent, fileIndex, currentSpeed, finalChunkIdx, bytesSentForThisChunk, compressedChunkSize);
                                         localLastNotificationTime = now;
                                     }
@@ -343,6 +348,10 @@ public class FileSender {
 
         try {
             socketChannel = SocketChannel.open();
+            // High-Speed Socket Configurations
+            socketChannel.socket().setTcpNoDelay(true);
+            socketChannel.socket().setSendBufferSize(1024 * 1024); // 1MB Output buffer
+            
             socketChannel.connect(new InetSocketAddress(peerIp, Constants.OFF_PORT_FILE));
             socketChannel.configureBlocking(true);
             socketOs = socketChannel.socket().getOutputStream();
@@ -418,7 +427,7 @@ public class FileSender {
                         WifeLogger.log(TAG, "Skipped bytes successfully: " + skipped);
                     }
 
-                    byte[] buffer = new byte[16384];
+                    byte[] buffer = new byte[65536]; // Increased from 16KB to 64KB for faster socket I/O
                     int readBytes;
                     long totalBytesSent = FileTransferForegroundService.lastPosition;
                     long lastNotificationUpdateTime = System.currentTimeMillis();
