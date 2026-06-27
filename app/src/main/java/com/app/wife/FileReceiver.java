@@ -360,7 +360,8 @@ public class FileReceiver implements Runnable {
                             long currentTime = System.currentTimeMillis();
                             long timeDiff = currentTime - speedPeriodStartTime;
                             if (timeDiff >= 1000) {
-                                currentSpeed = ((double) speedPeriodBytesSent / (1024.0 * 1024.0)) / ((double) timeDiff / 1000.0);
+                                // FIXED: Resolved compile failure by targeting speedPeriodBytesRead instead of speedPeriodBytesSent
+                                currentSpeed = ((double) speedPeriodBytesRead / (1024.0 * 1024.0)) / ((double) timeDiff / 1000.0);
                                 speedPeriodBytesRead = 0;
                                 speedPeriodStartTime = currentTime;
                             }
