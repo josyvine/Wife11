@@ -29,6 +29,8 @@ public class GroupCallManager {
     private static final String TAG = "GroupCallManager";
     private static volatile GroupCallManager instance;
 
+    private static final int CHUNK_SIZE = 1200; // MTU safe packet slice limit
+
     private final Context context;
     private final Handler mainHandler;
 
@@ -52,6 +54,9 @@ public class GroupCallManager {
     // Thread-safe map tracking peer unique ID hashes to their last active timestamps
     private final Map<Integer, Long> peerLastSeen = new ConcurrentHashMap<>();
 
+    // Jitter/Reassembly buffer caching incoming video frame slices per peer
+    private final Map<Integer, FrameBuffer> activeFrames = new ConcurrentHashMap<>();
+
     private GroupCallListener groupCallListener;
 
     public interface GroupCallListener {
@@ -59,6 +64,19 @@ public class GroupCallManager {
         void onPeerLeft(int peerIdHash);
         void onVideoFrameReceived(int peerIdHash, Bitmap bitmap);
         void onError(String error);
+    }
+
+    private static class FrameBuffer {
+        int sequenceId;
+        int totalChunks;
+        long timestamp;
+        Map<Integer, byte[]> chunks = new HashMap<>();
+
+        FrameBuffer(int sequenceId, int totalChunks) {
+            this.sequenceId = sequenceId;
+            this.totalChunks = totalChunks;
+            this.timestamp = System.currentTimeMillis();
+        }
     }
 
     public static GroupCallManager getInstance(Context context) {
@@ -95,6 +113,7 @@ public class GroupCallManager {
         
         peerAudioTracks.clear();
         peerLastSeen.clear();
+        activeFrames.clear();
 
         try {
             acquireMulticastLock();
@@ -241,17 +260,20 @@ public class GroupCallManager {
     }
 
     private void processVideoPacket(byte[] rawData, int length, String senderIp) {
-        if (length < 8) return;
+        if (length < 13) return; // 13-Byte header constraint validation
         
-        ByteBuffer wrap = ByteBuffer.wrap(rawData, 0, 8);
-        int senderId = wrap.getInt();
-        byte type = wrap.get();
+        ByteBuffer wrap = ByteBuffer.wrap(rawData, 0, 13);
+        int senderId = wrap.getInt();       // Bytes 0-3: Sender Hash ID
+        byte type = wrap.get();             // Byte 4: Type indicator (2 = Video)
+        int sequenceId = wrap.getInt();     // Bytes 5-8: Frame Sequence ID
+        int chunkIndex = wrap.getShort() & 0xFFFF;  // Bytes 9-10: Chunk index
+        int totalChunks = wrap.getShort() & 0xFFFF; // Bytes 11-12: Total chunk count
         
         if (senderId == selfIdHash || type != 2) {
             return; // Ignore self loops or mismatched types
         }
 
-        // Host-side software-defined UDP relay: forward to all other clients
+        // Host-side software-defined UDP relay: forward the exact raw payload directly to all other clients
         ConnectionManager conn = ConnectionManager.getInstance(context);
         if (conn.isHost() && senderIp != null && !senderIp.isEmpty()) {
             for (String ip : conn.getGroupPeers().values()) {
@@ -273,21 +295,61 @@ public class GroupCallManager {
 
         registerPeerActivity(senderId);
 
-        int videoDataLength = length - 8;
-        if (videoDataLength <= 0) return;
+        int payloadSize = length - 13;
+        if (payloadSize <= 0) return;
 
-        // Decode raw JPEG payload straight to Bitmap
-        try {
-            final Bitmap bitmap = BitmapFactory.decodeByteArray(rawData, 8, videoDataLength);
-            if (bitmap != null && groupCallListener != null) {
-                mainHandler.post(() -> {
-                    if (groupCallListener != null) {
-                        groupCallListener.onVideoFrameReceived(senderId, bitmap);
-                    }
-                });
+        // Retrieve or initiate frame buffering cache
+        FrameBuffer fb = activeFrames.get(senderId);
+        long now = System.currentTimeMillis();
+        
+        if (fb == null || fb.sequenceId != sequenceId || (now - fb.timestamp > 1500)) {
+            fb = new FrameBuffer(sequenceId, totalChunks);
+            activeFrames.put(senderId, fb);
+        }
+
+        // Add chunk details to active list
+        byte[] chunkBytes = new byte[payloadSize];
+        System.arraycopy(rawData, 13, chunkBytes, 0, payloadSize);
+        fb.chunks.put(chunkIndex, chunkBytes);
+
+        // Stitch elements on complete frame collection
+        if (fb.chunks.size() == fb.totalChunks) {
+            int totalBytes = 0;
+            boolean isBufferSymmetrical = true;
+            for (int i = 0; i < fb.totalChunks; i++) {
+                byte[] chunk = fb.chunks.get(i);
+                if (chunk != null) {
+                    totalBytes += chunk.length;
+                } else {
+                    isBufferSymmetrical = false;
+                    break;
+                }
             }
-        } catch (Exception e) {
-            WifeLogger.log(TAG, "Failed decoding group video stream frame: " + e.getMessage());
+
+            if (isBufferSymmetrical) {
+                byte[] fullFrame = new byte[totalBytes];
+                int currentOffset = 0;
+                for (int i = 0; i < fb.totalChunks; i++) {
+                    byte[] chunk = fb.chunks.get(i);
+                    System.arraycopy(chunk, 0, fullFrame, currentOffset, chunk.length);
+                    currentOffset += chunk.length;
+                }
+
+                // Decode raw JPEG payload straight to Bitmap
+                try {
+                    final Bitmap bitmap = BitmapFactory.decodeByteArray(fullFrame, 0, fullFrame.length);
+                    if (bitmap != null && groupCallListener != null) {
+                        mainHandler.post(() -> {
+                            if (groupCallListener != null) {
+                                groupCallListener.onVideoFrameReceived(senderId, bitmap);
+                            }
+                        });
+                    }
+                } catch (Exception e) {
+                    WifeLogger.log(TAG, "Failed decoding group video stream frame: " + e.getMessage());
+                }
+            }
+            activeFrames.remove(senderId); // Clean buffer on complete execution
         }
     }
 
@@ -347,6 +409,7 @@ public class GroupCallManager {
                         if (now - lastSeenTime > 5000) {
                             WifeLogger.log(TAG, "Watchdog timed out peer session: [" + peerId + "]");
                             peerLastSeen.remove(peerId);
+                            activeFrames.remove(peerId); // Clean cached frames for pruned peers
                             
                             // Clean up and release the dedicated AudioTrack for this timed out peer
                             AudioTrack track = peerAudioTracks.remove(peerId);
@@ -434,27 +497,16 @@ public class GroupCallManager {
     }
 
     /**
-     * Encapsulates JPEG bytes with our custom 8-byte header and broadcasts over UDP Port 8904.
+     * Slices larger JPEG payloads into safe packet frames and broadcasts them over UDP Port 8904.
      */
     public void broadcastVideoFrame(byte[] jpegData) {
         if (!isCallActive || videoSocket == null) return;
 
         try {
             int length = jpegData.length;
-            byte[] rawPayload = new byte[length + 8];
-            ByteBuffer buffer = ByteBuffer.wrap(rawPayload);
-            
-            // Build the custom 8-byte header structure
-            buffer.putInt(selfIdHash);    // Bytes 0-3: Sender Hash ID
-            buffer.put((byte) 2);         // Byte 4: Type indicator (2 = Video)
-            
-            // Append 3-byte sequence number
-            buffer.put((byte) ((videoSeq >> 16) & 0xFF));
-            buffer.put((byte) ((videoSeq >> 8) & 0xFF));
-            buffer.put((byte) (videoSeq & 0xFF));
+            int totalChunks = (int) Math.ceil((double) length / CHUNK_SIZE);
+            int currentSeq = videoSeq;
             videoSeq++;
-
-            System.arraycopy(jpegData, 0, rawPayload, 8, length);
 
             ConnectionManager conn = ConnectionManager.getInstance(context);
             List<InetAddress> targets = new ArrayList<>();
@@ -477,18 +529,36 @@ public class GroupCallManager {
                 targets.add(InetAddress.getByName("192.168.49.255"));
             } catch (Exception ignored) {}
 
-            for (InetAddress dest : targets) {
-                final DatagramPacket packet = new DatagramPacket(rawPayload, rawPayload.length, dest, Constants.OFF_PORT_GROUP_VIDEO);
-                new Thread(() -> {
-                    try {
-                        if (videoSocket != null && !videoSocket.isClosed()) {
-                            videoSocket.send(packet);
-                        }
-                    } catch (IOException ignored) {}
-                }).start();
+            // Slice raw frame sequentially and send each slice
+            for (int i = 0; i < totalChunks; i++) {
+                int offset = i * CHUNK_SIZE;
+                int sliceSize = Math.min(CHUNK_SIZE, length - offset);
+
+                byte[] chunkPayload = new byte[sliceSize + 13];
+                ByteBuffer buffer = ByteBuffer.wrap(chunkPayload);
+                
+                // Build the custom 13-byte header structure
+                buffer.putInt(selfIdHash);           // Bytes 0-3: Sender Hash ID
+                buffer.put((byte) 2);                // Byte 4: Type indicator (2 = Video)
+                buffer.putInt(currentSeq);           // Bytes 5-8: Frame Sequence ID
+                buffer.putShort((short) i);          // Bytes 9-10: Chunk index within frame
+                buffer.putShort((short) totalChunks);// Bytes 11-12: Total chunk count
+
+                System.arraycopy(jpegData, offset, chunkPayload, 13, sliceSize);
+
+                for (InetAddress dest : targets) {
+                    final DatagramPacket packet = new DatagramPacket(chunkPayload, chunkPayload.length, dest, Constants.OFF_PORT_GROUP_VIDEO);
+                    new Thread(() -> {
+                        try {
+                            if (videoSocket != null && !videoSocket.isClosed()) {
+                                videoSocket.send(packet);
+                            }
+                        } catch (IOException ignored) {}
+                    }).start();
+                }
             }
         } catch (Exception e) {
-            WifeLogger.log(TAG, "Failed drafting outbound video packet: " + e.getMessage());
+            WifeLogger.log(TAG, "Failed drafting outbound video packet slices: " + e.getMessage());
         }
     }
 
@@ -562,6 +632,7 @@ public class GroupCallManager {
         }
 
         peerLastSeen.clear();
+        activeFrames.clear(); // Clear jitter cache
         groupCallListener = null;
         
         WifeLogger.log(TAG, "Group call engine teardown complete.");
