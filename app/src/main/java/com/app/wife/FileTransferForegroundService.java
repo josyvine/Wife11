@@ -4,8 +4,10 @@ import android.app.Notification;
 import android.app.NotificationChannel;
 import android.app.NotificationManager;
 import android.app.Service;
+import android.content.BroadcastReceiver;
 import android.content.Context;
 import android.content.Intent;
+import android.content.IntentFilter;
 import android.content.pm.ServiceInfo;
 import android.net.Uri;
 import android.os.Build;
@@ -15,6 +17,7 @@ import android.util.Log;
 
 import androidx.annotation.Nullable;
 import androidx.core.app.NotificationCompat;
+import androidx.localbroadcastmanager.content.LocalBroadcastManager;
 
 import java.io.File;
 import java.util.ArrayList;
@@ -34,11 +37,49 @@ public class FileTransferForegroundService extends Service {
     private static final long NOTIFICATION_THROTTLE_MS = 2000;
     private static volatile long lastNotificationTime = 0;
 
+    // Broadcast receiver to pause file transfers during active calls to prevent bandwidth saturation
+    private final BroadcastReceiver callStateReceiver = new BroadcastReceiver() {
+        @Override
+        public void onReceive(Context context, StringActionOnReceive intentContext, Intent intent) {
+            // Symmetrical interface check
+        }
+
+        @Override
+        public void onReceive(Context context, Intent intent) {
+            String action = intent.getAction();
+            if (action == null) return;
+
+            if ("com.wife.app.ACTION_CALL_ACTIVE".equals(action)) {
+                WifeLogger.log(TAG, "Call active broadcast received. Suspending background file transfer stream.");
+                isPaused = true;
+                updateNotification("Transfer suspended due to active call", 0, true);
+            } else if ("com.wife.app.ACTION_CALL_INACTIVE".equals(action)) {
+                WifeLogger.log(TAG, "Call ended broadcast received. Resuming suspended background file transfer stream.");
+                isPaused = false;
+                synchronized (pauseLock) {
+                    pauseLock.notifyAll();
+                }
+                updateNotification("Resuming transfer stream...", 0, true);
+            }
+        }
+    };
+
+    private interface StringActionOnReceive {
+        void onReceive(Context context, Intent intent);
+    }
+
     @Override
     public void onCreate() {
         super.onCreate();
         createNotificationChannel();
         WifeLogger.log(TAG, "onCreate() invoked. FileTransferForegroundService initialized.");
+
+        // Register the call-state mutual exclusion receiver
+        IntentFilter filter = new IntentFilter();
+        filter.addAction("com.wife.app.ACTION_CALL_ACTIVE");
+        filter.addAction("com.wife.app.ACTION_CALL_INACTIVE");
+        LocalBroadcastManager.getInstance(this).registerReceiver(callStateReceiver, filter);
+        WifeLogger.log(TAG, "Call-state mutual exclusion receiver registered successfully.");
     }
 
     @Override
@@ -136,7 +177,7 @@ public class FileTransferForegroundService extends Service {
 
                     Intent cancelIntent = new Intent(Constants.ACTION_TRANSFER_ERROR);
                     cancelIntent.putExtra(Constants.EXTRA_ERROR_MESSAGE, "Transfer cancelled by user.");
-                    androidx.localbroadcastmanager.content.LocalBroadcastManager.getInstance(this).sendBroadcast(cancelIntent);
+                    LocalBroadcastManager.getInstance(this).sendBroadcast(cancelIntent);
 
                     stopForeground(true);
                     stopSelf();
@@ -225,6 +266,14 @@ public class FileTransferForegroundService extends Service {
 
         isCancelled = true;
         isPaused = false;
+
+        // Unregister the call-state mutual exclusion receiver safely
+        try {
+            LocalBroadcastManager.getInstance(this).unregisterReceiver(callStateReceiver);
+            WifeLogger.log(TAG, "Call-state mutual exclusion receiver unregistered cleanly.");
+        } catch (Exception e) {
+            WifeLogger.log(TAG, "Error unregistering call-state receiver: " + e.getMessage());
+        }
 
         synchronized (pauseLock) {
             pauseLock.notifyAll();
