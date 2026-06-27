@@ -40,11 +40,6 @@ public class FileTransferForegroundService extends Service {
     // Broadcast receiver to pause file transfers during active calls to prevent bandwidth saturation
     private final BroadcastReceiver callStateReceiver = new BroadcastReceiver() {
         @Override
-        public void onReceive(Context context, StringActionOnReceive intentContext, Intent intent) {
-            // Symmetrical interface check
-        }
-
-        @Override
         public void onReceive(Context context, Intent intent) {
             String action = intent.getAction();
             if (action == null) return;
@@ -63,10 +58,6 @@ public class FileTransferForegroundService extends Service {
             }
         }
     };
-
-    private interface StringActionOnReceive {
-        void onReceive(Context context, Intent intent);
-    }
 
     @Override
     public void onCreate() {
