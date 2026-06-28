@@ -32,6 +32,7 @@ public class FileTransferForegroundService extends Service {
     public static final Object pauseLock = new Object();
     public static volatile boolean isPaused = false;
     public static volatile boolean isCancelled = false;
+    public static volatile boolean isUserCancelled = false; // Tracks explicit user cancellation
     public static volatile long lastPosition = 0;
 
     // Global transaction reference counter to track active parallel send/receive sessions
@@ -111,6 +112,7 @@ public class FileTransferForegroundService extends Service {
                 case Constants.ACTION_START_TRANSFER:
                     isCancelled = false;
                     isPaused = false;
+                    isUserCancelled = false; // Reset manual cancel flag
                     lastPosition = 0;
                     lastNotificationTime = 0; // Reset throttling mark
 
@@ -184,6 +186,7 @@ public class FileTransferForegroundService extends Service {
                     WifeLogger.log(TAG, "ACTION_CANCEL_TRANSFER received. Purging sockets and shutting down.");
                     isCancelled = true;
                     isPaused = false;
+                    isUserCancelled = true; // Flag manual user abort
                     synchronized (pauseLock) {
                         pauseLock.notifyAll();
                     }
@@ -302,8 +305,8 @@ public class FileTransferForegroundService extends Service {
                     boolean isTempStream = name.startsWith("temp_send_") || name.startsWith("temp_recv_");
                     boolean isChunkPart = name.startsWith("chunk_") || name.startsWith("temp_chunk_");
 
-                    // FIXED: Symmetrical check prevents deletion of parallel chunks belonging to other active file queues
-                    if (isTempStream || (isCancelled && isChunkPart)) {
+                    // FIXED: only delete raw chunk parts if the user explicitly cancelled the transfer
+                    if (isTempStream || (isUserCancelled && isChunkPart)) {
                         boolean deleted = f.delete();
                         WifeLogger.log(TAG, "Purged temporary cache file during destroy: " + name + " -> " + deleted);
                     }
@@ -322,8 +325,8 @@ public class FileTransferForegroundService extends Service {
                         boolean isTempStream = name.startsWith("temp_send_") || name.startsWith("temp_recv_");
                         boolean isChunkPart = name.startsWith("chunk_") || name.startsWith("temp_chunk_");
 
-                        // FIXED: Symmetrical check prevents deletion of parallel chunks belonging to other active file queues
-                        if (isTempStream || (isCancelled && isChunkPart)) {
+                        // FIXED: only delete raw chunk parts if the user explicitly cancelled the transfer
+                        if (isTempStream || (isUserCancelled && isChunkPart)) {
                             boolean deleted = f.delete();
                             WifeLogger.log(TAG, "Purged temporary backups file during destroy: " + name + " -> " + deleted);
                         }
@@ -334,6 +337,7 @@ public class FileTransferForegroundService extends Service {
             WifeLogger.log(TAG, "Failed executing public backups purge during destroy: " + e.getMessage());
         }
 
+        isUserCancelled = false; // Reset manual cancellation flag
         super.onDestroy();
     }
 }
