@@ -335,7 +335,7 @@ public class FileSender {
                             isChunkFullyWritten = true; // Mark as completely written into native TCP buffers
 
                             int finalPercent = (int) ((totalBytesSentCombined.get() * 100) / fileSize);
-                            broadcastChunkProgress(fileName, totalBytesSentCombined.get(), fileSize, finalPercent, fileIndex, 0.0, finalChunkIdx, compressedSize, compressedSize);
+                            broadcastChunkProgress(fileName, totalBytesSentCombined.get(), fileSize, finalPercent, fileIndex, 0.0, finalChunkIdx, compressedChunkSize, compressedChunkSize);
 
                             chunkChannel.socket().shutdownOutput();
                             Thread.sleep(500); // 500ms grace window to prevent connection truncation freezes
