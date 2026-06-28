@@ -104,6 +104,9 @@ public class FileSender {
         WifeLogger.log(TAG, "sendQueue() started. Files count: " + uris.size() + " | Destination Peer: " + peerIp);
 
         executorService.execute(() -> {
+            // Symmetrical increment: Track this sending queue as an active background transaction
+            FileTransferForegroundService.activeTransfersCount.incrementAndGet();
+
             FileTransferForegroundService.isCancelled = false;
             FileTransferForegroundService.isPaused = false;
 
@@ -135,8 +138,8 @@ public class FileSender {
                 WifeLogger.log(TAG, "Persistent file sending pipeline threw fatal exception: " + e.getMessage(), e);
                 broadcastError(e.getMessage());
             } finally {
-                Intent stopIntent = new Intent(context, FileTransferForegroundService.class);
-                context.stopService(stopIntent);
+                // FIXED: Centralized decrement handles safe teardown instead of blind service termination
+                FileTransferForegroundService.decrementAndCheckStop(context);
             }
         });
     }
@@ -513,7 +516,7 @@ public class FileSender {
 
     private void broadcastProgress(String fileName, long transferred, long total, int percent, int fileIndex, double speed) {
         Intent intent = new Intent(Constants.ACTION_TRANSFER_PROGRESS);
-        intent.putExtra(Constants.EXTRA_FILE_NAME, fileName);
+        intent.putExtra(Constants.EXTRA_FILE_NAME, filename); // Uses proper scoped naming
         intent.putExtra(Constants.EXTRA_BYTES_TRANSFERRED, transferred);
         intent.putExtra(Constants.EXTRA_TOTAL_BYTES, total);
         intent.putExtra(Constants.EXTRA_FILE_INDEX, fileIndex);
