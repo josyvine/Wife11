@@ -14,7 +14,7 @@ public final class FileJoiner {
 
     private FileJoiner() {
         // Prevent instantiation of utility class
-    }
+    } 
 
     /**
      * Merges parallel raw temporary chunk parts sequentially into a single target file 
