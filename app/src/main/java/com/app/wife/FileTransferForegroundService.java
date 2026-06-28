@@ -21,6 +21,7 @@ import androidx.localbroadcastmanager.content.LocalBroadcastManager;
 
 import java.io.File;
 import java.util.ArrayList;
+import java.util.concurrent.atomic.AtomicInteger;
 
 public class FileTransferForegroundService extends Service {
     private static final String TAG = "FileTransferService";
@@ -32,6 +33,9 @@ public class FileTransferForegroundService extends Service {
     public static volatile boolean isPaused = false;
     public static volatile boolean isCancelled = false;
     public static volatile long lastPosition = 0;
+
+    // Global transaction reference counter to track active parallel send/receive sessions
+    public static final AtomicInteger activeTransfersCount = new AtomicInteger(0);
 
     // System IPC Throttling variables (Rule 1 Fix: ANR Prevention)
     private static final long NOTIFICATION_THROTTLE_MS = 2000;
@@ -58,6 +62,24 @@ public class FileTransferForegroundService extends Service {
             }
         }
     };
+
+    /**
+     * Decentralized termination controller. Decrements the active transaction count 
+     * and safely stops the service only when all parallel streams have finalized.
+     */
+    public static void decrementAndCheckStop(Context context) {
+        int active = activeTransfersCount.decrementAndGet();
+        if (active < 0) {
+            activeTransfersCount.set(0);
+            active = 0;
+        }
+        WifeLogger.log(TAG, "decrementAndCheckStop() executed. Remaining active transfer sessions: " + active);
+        if (active == 0) {
+            WifeLogger.log(TAG, "No active transactions remaining. Halting FileTransferForegroundService.");
+            Intent stopIntent = new Intent(context, FileTransferForegroundService.class);
+            context.stopService(stopIntent);
+        }
+    }
 
     @Override
     public void onCreate() {
