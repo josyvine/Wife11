@@ -323,6 +323,16 @@ public class FileReceiver implements Runnable {
                         notifyChunkProgress(context, filename, percent, completed * 20L * 1024L * 1024L, originalSize, fileIndex, 0.0, chunkIndex, compressedSize, compressedSize);
 
                         if (completed == totalChunks) {
+                            // FIXED: Force immediate shutdown and closure of current socket connection
+                            // to ensure FIN/ACK handshakes complete before the eMMC merging locks the system.
+                            try {
+                                socketChannel.socket().shutdownInput();
+                                socketChannel.socket().shutdownOutput();
+                            } catch (Exception ignored) {}
+                            try {
+                                socketChannel.close();
+                            } catch (Exception ignored) {}
+
                             mergeChunksAndFinalize(context, fileId, totalChunks, targetDir, filename, originalSize, fileIndex);
                         }
                     }
