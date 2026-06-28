@@ -516,7 +516,8 @@ public class FileSender {
 
     private void broadcastProgress(String fileName, long transferred, long total, int percent, int fileIndex, double speed) {
         Intent intent = new Intent(Constants.ACTION_TRANSFER_PROGRESS);
-        intent.putExtra(Constants.EXTRA_FILE_NAME, filename); // Uses proper scoped naming
+        // FIXED: Replaced misspelled reference variable name 'filename' with 'fileName' parameter
+        intent.putExtra(Constants.EXTRA_FILE_NAME, fileName);
         intent.putExtra(Constants.EXTRA_BYTES_TRANSFERRED, transferred);
         intent.putExtra(Constants.EXTRA_TOTAL_BYTES, total);
         intent.putExtra(Constants.EXTRA_FILE_INDEX, fileIndex);
@@ -550,7 +551,7 @@ public class FileSender {
         serviceIntent.setAction("UPDATE_NOTIF");
         serviceIntent.putExtra("NOTIF_TEXT", "Sending Chunk #" + (chunkIndex + 1) + " of " + fileName + " (" + percent + "%) - " + speedText);
         serviceIntent.putExtra("PROGRESS", percent);
-        context.startService(serviceIntent);
+        context.startService(context, serviceIntent);
     }
 
     private void broadcastCompletion() {
