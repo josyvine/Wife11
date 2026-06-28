@@ -154,7 +154,7 @@ public class FileTransferActivity extends AppCompatActivity implements
                     activeChunkViews.clear();
                     loadHistory();
                     
-                    stopService(new Intent(FileTransferActivity.this, FileTransferForegroundService.class));
+                    // FIXED: Removed manual stopService call to let FileTransferForegroundService govern its own lifecycle
                     break;
 
                 case Constants.ACTION_TRANSFER_ERROR:
@@ -169,7 +169,7 @@ public class FileTransferActivity extends AppCompatActivity implements
                     activeChunkViews.clear();
                     loadHistory();
                     
-                    stopService(new Intent(FileTransferActivity.this, FileTransferForegroundService.class));
+                    // FIXED: Removed manual stopService call to let FileTransferForegroundService govern its own lifecycle
                     break;
             }
         }
