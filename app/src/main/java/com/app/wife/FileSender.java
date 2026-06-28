@@ -98,7 +98,7 @@ public class FileSender {
 
     /**
      * Core Persistent High-Speed Queue Transmitter.
-     * Maintains separate SocketChannels across parallel worker executions.
+     * Maintains a persistent SocketChannel across sequential worker executions.
      */
     public void sendQueue(final List<Uri> uris, final List<String> fileNames, final long[] fileSizes, final String peerIp) {
         WifeLogger.log(TAG, "sendQueue() started. Files count: " + uris.size() + " | Destination Peer: " + peerIp);
@@ -109,6 +109,8 @@ public class FileSender {
 
             FileTransferForegroundService.isCancelled = false;
             FileTransferForegroundService.isPaused = false;
+
+            SocketChannel persistentChannel = null;
 
             try {
                 for (int i = 0; i < uris.size(); i++) {
@@ -122,12 +124,36 @@ public class FileSender {
                     long fileSize = fileSizes[i];
 
                     if (fileSize > CHUNK_THRESHOLD) {
+                        // Close any existing persistent sequential channel to avoid blocking parallel chunk sockets
+                        if (persistentChannel != null) {
+                            try {
+                                persistentChannel.socket().shutdownOutput();
+                                Thread.sleep(200);
+                            } catch (Exception ignored) {}
+                            try { persistentChannel.close(); } catch (Exception ignored) {}
+                            persistentChannel = null;
+                        }
                         WifeLogger.log(TAG, "File size exceeds 100MB threshold. Initiating parallel chunked stream pipeline.");
                         sendLargeFileInParallel(fileUri, fileName, fileSize, peerIp, i);
                     } else {
                         WifeLogger.log(TAG, "File size is below 100MB. Proceeding with standard sequential LZ4 streaming.");
-                        sendSequentialFile(fileUri, fileName, fileSize, peerIp, i);
+                        if (persistentChannel == null || !persistentChannel.isConnected() || !persistentChannel.isOpen()) {
+                            persistentChannel = SocketChannel.open();
+                            persistentChannel.socket().setTcpNoDelay(true);
+                            persistentChannel.socket().setSendBufferSize(1024 * 1024);
+                            persistentChannel.connect(new InetSocketAddress(peerIp, Constants.OFF_PORT_FILE));
+                            persistentChannel.configureBlocking(true);
+                        }
+                        sendSequentialFilePersistent(fileUri, fileName, fileSize, persistentChannel, i);
                     }
+                }
+
+                // Send the persistent queue stream end marker (metadata length of 0) to notify receiver cleanly
+                if (persistentChannel != null && persistentChannel.isConnected()) {
+                    OutputStream socketOs = persistentChannel.socket().getOutputStream();
+                    byte[] endMarker = new byte[4]; // 0 size
+                    socketOs.write(endMarker);
+                    socketOs.flush();
                 }
 
                 if (!FileTransferForegroundService.isCancelled) {
@@ -138,7 +164,14 @@ public class FileSender {
                 WifeLogger.log(TAG, "Persistent file sending pipeline threw fatal exception: " + e.getMessage(), e);
                 broadcastError(e.getMessage());
             } finally {
-                // FIXED: Centralized decrement handles safe teardown instead of blind service termination
+                if (persistentChannel != null) {
+                    try {
+                        persistentChannel.socket().shutdownOutput();
+                        Thread.sleep(500);
+                    } catch (Exception ignored) {}
+                    try { persistentChannel.close(); } catch (IOException ignored) {}
+                }
+                // Centralized decrement handles safe teardown instead of blind service termination
                 FileTransferForegroundService.decrementAndCheckStop(context);
             }
         });
@@ -342,158 +375,147 @@ public class FileSender {
     }
 
     /**
-     * Standard sequential LZ4 file transmitter for files under 100MB.
+     * Standard sequential LZ4 file transmitter for files under 100MB inside the persistent SocketChannel queue.
      * Uses optimized buffered streams and safe public backups locations to prevent storage depletion.
      */
-    private void sendSequentialFile(Uri fileUri, String fileName, long fileSize, String peerIp, int fileIndex) throws Exception {
-        SocketChannel socketChannel = null;
-        OutputStream socketOs = null;
+    private void sendSequentialFilePersistent(Uri fileUri, String fileName, long fileSize, SocketChannel socketChannel, int fileIndex) throws Exception {
+        OutputStream socketOs = socketChannel.socket().getOutputStream();
+        File tempCompressedFile = new File(getBackupDirectory(), "temp_send_" + UUID.randomUUID().toString() + "_" + fileName + ".lz4");
 
         try {
-            socketChannel = SocketChannel.open();
-            // High-Speed Socket Configurations
-            socketChannel.socket().setTcpNoDelay(true);
-            socketChannel.socket().setSendBufferSize(1024 * 1024); // 1MB Output buffer
-            
-            socketChannel.connect(new InetSocketAddress(peerIp, Constants.OFF_PORT_FILE));
-            socketChannel.configureBlocking(true);
-            socketOs = socketChannel.socket().getOutputStream();
+            try (InputStream is = context.getContentResolver().openInputStream(fileUri);
+                 BufferedInputStream bis = new BufferedInputStream(is, 128 * 1024);
+                 FileOutputStream fos = new FileOutputStream(tempCompressedFile);
+                 BufferedOutputStream bos = new BufferedOutputStream(fos, 128 * 1024);
+                 net.jpountz.lz4.LZ4FrameOutputStream lz4Out = new net.jpountz.lz4.LZ4FrameOutputStream(bos, net.jpountz.lz4.LZ4FrameOutputStream.BLOCKSIZE.SIZE_256KB)) {
 
-            File tempCompressedFile = new File(getBackupDirectory(), "temp_send_" + UUID.randomUUID().toString() + "_" + fileName + ".lz4");
+                if (is == null) throw new IOException("Failed opening content URI stream.");
 
-            try {
-                try (InputStream is = context.getContentResolver().openInputStream(fileUri);
-                     BufferedInputStream bis = new BufferedInputStream(is, 128 * 1024);
-                     FileOutputStream fos = new FileOutputStream(tempCompressedFile);
-                     BufferedOutputStream bos = new BufferedOutputStream(fos, 128 * 1024);
-                     net.jpountz.lz4.LZ4FrameOutputStream lz4Out = new net.jpountz.lz4.LZ4FrameOutputStream(bos, net.jpountz.lz4.LZ4FrameOutputStream.BLOCKSIZE.SIZE_256KB)) {
+                byte[] buffer = new byte[65536];
+                int read;
+                long bytesReadTotal = 0;
+                long lastProgressUpdate = System.currentTimeMillis();
 
-                    if (is == null) throw new IOException("Failed opening content URI stream.");
+                while ((read = bis.read(buffer)) != -1) {
+                    if (FileTransferForegroundService.isCancelled) break;
 
-                    byte[] buffer = new byte[65536];
-                    int read;
-                    long bytesReadTotal = 0;
-                    long lastProgressUpdate = System.currentTimeMillis();
-
-                    while ((read = bis.read(buffer)) != -1) {
-                        if (FileTransferForegroundService.isCancelled) break;
-
-                        synchronized (FileTransferForegroundService.pauseLock) {
-                            while (FileTransferForegroundService.isPaused && !FileTransferForegroundService.isCancelled) {
-                                try {
-                                    FileTransferForegroundService.pauseLock.wait();
-                                } catch (InterruptedException ignored) {}
-                            }
-                        }
-
-                        lz4Out.write(buffer, 0, read);
-                        bytesReadTotal += read;
-
-                        long currentTime = System.currentTimeMillis();
-                        // FIXED: Correctly reassign lastProgressUpdate inside loop to throttle compression updates
-                        if (currentTime - lastProgressUpdate >= 1000) {
-                            int percent = (fileSize > 0) ? (int) ((bytesReadTotal * 100) / fileSize) : 0;
-                            broadcastProgress("Compressing: " + fileName, bytesReadTotal, fileSize, percent, fileIndex, 0.0);
-                            lastProgressUpdate = currentTime;
+                    synchronized (FileTransferForegroundService.pauseLock) {
+                        while (FileTransferForegroundService.isPaused && !FileTransferForegroundService.isCancelled) {
+                            try {
+                                FileTransferForegroundService.pauseLock.wait();
+                            } catch (InterruptedException ignored) {}
                         }
                     }
-                    lz4Out.flush();
-                }
 
-                long compressedSize = tempCompressedFile.length();
-                WifeLogger.log(TAG, "Compression complete. Compressed Size: " + compressedSize + " bytes.");
+                    lz4Out.write(buffer, 0, read);
+                    bytesReadTotal += read;
 
-                if (FileTransferForegroundService.isCancelled) return;
-
-                JsonObject fileMeta = new JsonObject();
-                fileMeta.addProperty("type", "file");
-                fileMeta.addProperty("name", fileName);
-                fileMeta.addProperty("size", fileSize);
-                fileMeta.addProperty("compressedSize", compressedSize);
-                fileMeta.addProperty("lastPosition", FileTransferForegroundService.lastPosition);
-
-                byte[] metaBytes = fileMeta.toString().getBytes(StandardCharsets.UTF_8);
-                byte[] lenBytes = new byte[4];
-                lenBytes[0] = (byte) ((metaBytes.length >> 24) & 0xFF);
-                lenBytes[1] = (byte) ((metaBytes.length >> 16) & 0xFF);
-                lenBytes[2] = (byte) ((metaBytes.length >> 8) & 0xFF);
-                lenBytes[3] = (byte) (metaBytes.length & 0xFF);
-
-                socketOs.write(lenBytes);
-                socketOs.write(metaBytes);
-                socketOs.flush();
-
-                try (FileInputStream fisCompressed = new FileInputStream(tempCompressedFile);
-                     BufferedInputStream bisCompressed = new BufferedInputStream(fisCompressed, 128 * 1024)) {
-                    if (FileTransferForegroundService.lastPosition > 0) {
-                        long skipped = bisCompressed.skip(FileTransferForegroundService.lastPosition);
-                        WifeLogger.log(TAG, "Skipped bytes successfully: " + skipped);
-                    }
-
-                    byte[] buffer = new byte[65536]; // Increased from 16KB to 64KB for faster socket I/O
-                    int readBytes;
-                    long totalBytesSent = FileTransferForegroundService.lastPosition;
-                    long lastNotificationUpdateTime = System.currentTimeMillis();
-                    long speedPeriodBytesSent = 0;
-                    long speedPeriodStartTime = System.currentTimeMillis();
-                    double currentSpeed = 0.0;
-
-                    while ((readBytes = bisCompressed.read(buffer)) != -1) {
-                        if (FileTransferForegroundService.isCancelled) break;
-
-                        synchronized (FileTransferForegroundService.pauseLock) {
-                            while (FileTransferForegroundService.isPaused && !FileTransferForegroundService.isCancelled) {
-                                try {
-                                    FileTransferForegroundService.pauseLock.wait();
-                                } catch (InterruptedException ignored) {}
-                            }
-                        }
-
-                        socketOs.write(buffer, 0, readBytes);
-                        totalBytesSent += readBytes;
-                        speedPeriodBytesSent += readBytes;
-                        FileTransferForegroundService.lastPosition = totalBytesSent;
-
-                        long currentTime = System.currentTimeMillis();
-                        long timeDiff = currentTime - speedPeriodStartTime;
-                        if (timeDiff >= 1000) {
-                            currentSpeed = ((double) speedPeriodBytesSent / (1024.0 * 1024.0)) / ((double) timeDiff / 1000.0);
-                            speedPeriodBytesSent = 0;
-                            speedPeriodStartTime = currentTime;
-                        }
-
-                        // FIXED: Correctly reassign lastNotificationUpdateTime inside loop to throttle network updates
-                        if (currentTime - lastNotificationUpdateTime >= 1000) {
-                            int percent = (int) ((totalBytesSent * 100) / compressedSize);
-                            broadcastProgress(fileName, totalBytesSent, compressedSize, percent, fileIndex, currentSpeed);
-                            lastNotificationUpdateTime = currentTime;
-                        }
+                    long currentTime = System.currentTimeMillis();
+                    // FIXED: Correctly reassign lastProgressUpdate inside loop to throttle compression updates
+                    if (currentTime - lastProgressUpdate >= 1000) {
+                        int percent = (fileSize > 0) ? (int) ((bytesReadTotal * 100) / fileSize) : 0;
+                        broadcastProgress("Compressing: " + fileName, bytesReadTotal, fileSize, percent, fileIndex, 0.0);
+                        lastProgressUpdate = currentTime;
                     }
                 }
+                lz4Out.flush();
+            }
 
-                if (!FileTransferForegroundService.isCancelled) {
-                    FileEntity entity = new FileEntity(fileName, fileSize, fileUri.toString(), System.currentTimeMillis());
-                    RoomDatabaseManager.getInstance(context).fileDao().insert(entity);
-                    FileTransferForegroundService.lastPosition = 0;
-                    broadcastProgress(fileName, compressedSize, compressedSize, 100, fileIndex, 0.0);
+            long compressedSize = tempCompressedFile.length();
+            WifeLogger.log(TAG, "Compression complete. Compressed Size: " + compressedSize + " bytes.");
+
+            if (FileTransferForegroundService.isCancelled) return;
+
+            JsonObject fileMeta = new JsonObject();
+            fileMeta.addProperty("type", "file");
+            fileMeta.addProperty("name", fileName);
+            fileMeta.addProperty("size", fileSize);
+            fileMeta.addProperty("compressedSize", compressedSize);
+            fileMeta.addProperty("lastPosition", FileTransferForegroundService.lastPosition);
+
+            byte[] metaBytes = fileMeta.toString().getBytes(StandardCharsets.UTF_8);
+            byte[] lenBytes = new byte[4];
+            lenBytes[0] = (byte) ((metaBytes.length >> 24) & 0xFF);
+            lenBytes[1] = (byte) ((metaBytes.length >> 16) & 0xFF);
+            lenBytes[2] = (byte) ((metaBytes.length >> 8) & 0xFF);
+            lenBytes[3] = (byte) (metaBytes.length & 0xFF);
+
+            socketOs.write(lenBytes);
+            socketOs.write(metaBytes);
+            socketOs.flush();
+
+            try (FileInputStream fisCompressed = new FileInputStream(tempCompressedFile);
+                 BufferedInputStream bisCompressed = new BufferedInputStream(fisCompressed, 128 * 1024)) {
+                if (FileTransferForegroundService.lastPosition > 0) {
+                    long skipped = bisCompressed.skip(FileTransferForegroundService.lastPosition);
+                    WifeLogger.log(TAG, "Skipped bytes successfully: " + skipped);
                 }
-            } finally {
-                if (tempCompressedFile.exists()) {
-                    tempCompressedFile.delete();
+
+                byte[] buffer = new byte[65536]; // Increased from 16KB to 64KB for faster socket I/O
+                int readBytes;
+                long totalBytesSent = FileTransferForegroundService.lastPosition;
+                long lastNotificationUpdateTime = System.currentTimeMillis();
+                long speedPeriodBytesSent = 0;
+                long speedPeriodStartTime = System.currentTimeMillis();
+                double currentSpeed = 0.0;
+
+                while ((readBytes = bisCompressed.read(buffer)) != -1) {
+                    if (FileTransferForegroundService.isCancelled) break;
+
+                    synchronized (FileTransferForegroundService.pauseLock) {
+                        while (FileTransferForegroundService.isPaused && !FileTransferForegroundService.isCancelled) {
+                            try {
+                                FileTransferForegroundService.pauseLock.wait();
+                            } catch (InterruptedException ignored) {}
+                        }
+                    }
+
+                    socketOs.write(buffer, 0, readBytes);
+                    totalBytesSent += readBytes;
+                    speedPeriodBytesSent += readBytes;
+                    FileTransferForegroundService.lastPosition = totalBytesSent;
+
+                    long currentTime = System.currentTimeMillis();
+                    long timeDiff = currentTime - speedPeriodStartTime;
+                    if (timeDiff >= 1000) {
+                        currentSpeed = ((double) speedPeriodBytesSent / (1024.0 * 1024.0)) / ((double) timeDiff / 1000.0);
+                        speedPeriodBytesSent = 0;
+                        speedPeriodStartTime = currentTime;
+                    }
+
+                    // FIXED: Correctly reassign lastNotificationUpdateTime inside loop to throttle network updates
+                    if (currentTime - lastNotificationUpdateTime >= 1000) {
+                        int percent = (int) ((totalBytesSent * 100) / compressedSize);
+                        broadcastProgress(fileName, totalBytesSent, compressedSize, percent, fileIndex, currentSpeed);
+                        lastNotificationUpdateTime = currentTime;
+                    }
                 }
             }
+
+            if (!FileTransferForegroundService.isCancelled) {
+                FileEntity entity = new FileEntity(fileName, fileSize, fileUri.toString(), System.currentTimeMillis());
+                RoomDatabaseManager.getInstance(context).fileDao().insert(entity);
+                FileTransferForegroundService.lastPosition = 0;
+                broadcastProgress(fileName, compressedSize, compressedSize, 100, fileIndex, 0.0);
+            }
         } finally {
-            try {
-                if (socketChannel != null && socketChannel.socket() != null && !socketChannel.socket().isClosed()) {
-                    socketChannel.socket().shutdownOutput();
-                    Thread.sleep(500); // 500ms grace window to prevent connection truncation freezes
-                }
-            } catch (Exception ignored) {}
-            try {
-                if (socketChannel != null && socketChannel.isOpen()) {
-                    socketChannel.close();
-                }
-            } catch (IOException ignored) {}
+            if (tempCompressedFile.exists()) {
+                tempCompressedFile.delete();
+            }
+        }
+    }
+
+    /**
+     * Backward-compatible standard sequential LZ4 file transmitter for files under 100MB.
+     * Delegates natively to opening a socket and streaming as an isolated single file task.
+     */
+    public void sendSequentialFile(Uri fileUri, String fileName, long fileSize, String peerIp, int fileIndex) throws Exception {
+        try (SocketChannel socketChannel = SocketChannel.open()) {
+            socketChannel.socket().setTcpNoDelay(true);
+            socketChannel.socket().setSendBufferSize(1024 * 1024);
+            socketChannel.connect(new InetSocketAddress(peerIp, Constants.OFF_PORT_FILE));
+            socketChannel.configureBlocking(true);
+            sendSequentialFilePersistent(fileUri, fileName, fileSize, socketChannel, fileIndex);
         }
     }
 
