@@ -419,34 +419,42 @@ public class FileReceiver implements Runnable {
      * Glues raw temporary chunk files back into a single valid uncompressed file via the high-speed FileJoiner.
      */
     private static void mergeChunksAndFinalize(Context context, String fileId, int totalChunks, File targetDir, String filename, long originalSize, int fileIndex) {
+        // FIXED: Increment the active transactions counter before spawning the background merge thread to prevent race condition teardown
+        FileTransferForegroundService.activeTransfersCount.incrementAndGet();
+
         new Thread(() -> {
-            File fileDest = new File(targetDir, filename);
-            WifeLogger.log(TAG, "All chunks received. Merging chunk parts into final file: " + fileDest.getAbsolutePath());
+            try {
+                File fileDest = new File(targetDir, filename);
+                WifeLogger.log(TAG, "All chunks received. Merging chunk parts into final file: " + fileDest.getAbsolutePath());
 
-            boolean success = FileJoiner.mergeParts(context, fileId, totalChunks, fileDest);
+                boolean success = FileJoiner.mergeParts(context, fileId, totalChunks, fileDest);
 
-            if (success) {
-                try {
-                    WifeLogger.log(TAG, "File successfully decrypted, merged and saved: " + fileDest.getAbsolutePath());
+                if (success) {
+                    try {
+                        WifeLogger.log(TAG, "File successfully decrypted, merged and saved: " + fileDest.getAbsolutePath());
 
-                    FileEntity entity = new FileEntity(filename, originalSize, fileDest.getAbsolutePath(), System.currentTimeMillis());
-                    RoomDatabaseManager.getInstance(context).fileDao().insert(entity);
+                        FileEntity entity = new FileEntity(filename, originalSize, fileDest.getAbsolutePath(), System.currentTimeMillis());
+                        RoomDatabaseManager.getInstance(context).fileDao().insert(entity);
 
-                    notifyComplete(context, filename, fileDest.getAbsolutePath(), fileIndex);
-                    
-                    // Symmetrical solution for parallel chunked files:
-                    // Force complete system tray notification and layout dismissal on parallel merge completion (Glitch Fix)
-                    broadcastCompletion(context);
-                    
-                    activeTransfers.remove(fileId);
-                    lastBroadcastTimes.remove(filename);
-                } catch (Exception e) {
-                    WifeLogger.log(TAG, "Database log persistence failed after zero-copy merge: " + e.getMessage(), e);
-                    broadcastError(context, e.getMessage());
+                        notifyComplete(context, filename, fileDest.getAbsolutePath(), fileIndex);
+                        
+                        // Symmetrical solution for parallel chunked files:
+                        // Force complete system tray notification and layout dismissal on parallel merge completion (Glitch Fix)
+                        broadcastCompletion(context);
+                        
+                        activeTransfers.remove(fileId);
+                        lastBroadcastTimes.remove(filename);
+                    } catch (Exception e) {
+                        WifeLogger.log(TAG, "Database log persistence failed after zero-copy merge: " + e.getMessage(), e);
+                        broadcastError(context, e.getMessage());
+                    }
+                } else {
+                    WifeLogger.log(TAG, "Zero-copy chunk merge operation failed for File ID: " + fileId);
+                    broadcastError(context, "Assembling of the chunked payload failed on receiver side.");
                 }
-            } else {
-                WifeLogger.log(TAG, "Zero-copy chunk merge operation failed for File ID: " + fileId);
-                broadcastError(context, "Assembling of the chunked payload failed on receiver side.");
+            } finally {
+                // FIXED: Centralized decrement handles safe teardown inside finally block once the asynchronous merge thread completes
+                FileTransferForegroundService.decrementAndCheckStop(context);
             }
         }).start();
     }
@@ -478,9 +486,6 @@ public class FileReceiver implements Runnable {
             case "jpg":
             case "jpeg":
             case "png":
-            case "gif":
-            case "bmp":
-            case "webp":
                 subFolder = "images";
                 break;
             case "mp4":
