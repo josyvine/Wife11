@@ -67,6 +67,18 @@ public final class FileJoiner {
                 // Symmetrical instantly purge raw segment file to preserve device storage (ENOSPC fix)
                 boolean deleted = tempRawChunk.delete();
                 WifeLogger.log(TAG, "Purged temporary raw segment index: " + chunkIndex + " | Deleted: " + deleted);
+
+                // FIXED (High-Speed Storage Pacing): Yield time-slices to let Wi-Fi P2P drivers process beacons.
+                // Runs a tiny micro-sleep of 5ms every 15 chunks to prevent P2P network timeout drops.
+                if (chunkIndex % 15 == 0 && chunkIndex > 0) {
+                    try {
+                        Thread.sleep(5);
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                    }
+                } else {
+                    Thread.yield();
+                }
             }
             
             WifeLogger.log(TAG, "NIO parallel chunk merge completed successfully. Merged Size: " + destFile.length() + " bytes.");
