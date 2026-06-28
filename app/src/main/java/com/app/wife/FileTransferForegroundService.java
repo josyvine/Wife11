@@ -159,6 +159,14 @@ public class FileTransferForegroundService extends Service {
                     String notifText = intent.getStringExtra("NOTIF_TEXT");
                     int progressValue = intent.getIntExtra("PROGRESS", 0);
 
+                    // FIXED: Symmetrically promote receiver-side service to foreground when started or updated via UPDATE_NOTIF
+                    Notification initNotif = buildProgressNotification(notifText, progressValue, false);
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                        startForeground(NOTIF_ID, initNotif, ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC);
+                    } else {
+                        startForeground(NOTIF_ID, initNotif);
+                    }
+
                     // Throttling IPC: Enforces a maximum rate of 1 IPC transaction every 2 seconds to prevent ANR system freezes (Rule 1 Fix)
                     long currentTime = System.currentTimeMillis();
                     if (currentTime - lastNotificationTime >= NOTIFICATION_THROTTLE_MS) {
