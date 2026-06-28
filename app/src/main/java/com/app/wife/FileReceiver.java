@@ -84,11 +84,17 @@ public class FileReceiver implements Runnable {
     public void run() {
         WifeLogger.log(TAG, "Legacy FileReceiver runnable invoked. Redirecting to single socket processor.");
         try {
+            // Symmetrical increment: Track this session as an active background transaction
+            FileTransferForegroundService.activeTransfersCount.incrementAndGet();
+
             socket.getChannel().configureBlocking(true);
             processPersistentStream(context, socket.getChannel());
         } catch (Exception e) {
             WifeLogger.log(TAG, "Error executing legacy fallback: " + e.getMessage(), e);
             notifyError(e.getMessage());
+        } finally {
+            // FIXED: Centralized decrement handles safe teardown instead of blind service termination
+            FileTransferForegroundService.decrementAndCheckStop(context);
         }
     }
 
@@ -121,6 +127,10 @@ public class FileReceiver implements Runnable {
                             try {
                                 String clientIp = finalChannel.socket().getInetAddress().getHostAddress();
                                 WifeLogger.log(TAG, "Processing parallel transfer stream connection from: " + clientIp);
+                                
+                                // Symmetrical increment: Track this newly accepted socket connection as an active transaction
+                                FileTransferForegroundService.activeTransfersCount.incrementAndGet();
+
                                 processPersistentStream(context, finalChannel);
                             } catch (Exception e) {
                                 WifeLogger.log(TAG, "Parallel socket stream connection failed: " + e.getMessage(), e);
@@ -129,6 +139,9 @@ public class FileReceiver implements Runnable {
                                 try {
                                     finalChannel.close();
                                 } catch (IOException ignored) {}
+                                
+                                // FIXED: Centralized decrement handles safe teardown instead of blind service termination
+                                FileTransferForegroundService.decrementAndCheckStop(context);
                             }
                         });
 
@@ -605,9 +618,8 @@ public class FileReceiver implements Runnable {
     private static void broadcastCompletion(Context context) {
         Intent intent = new Intent(Constants.ACTION_TRANSFER_COMPLETE);
         LocalBroadcastManager.getInstance(context).sendBroadcast(intent);
-
-        Intent stopIntent = new Intent(context, FileTransferForegroundService.class);
-        context.stopService(stopIntent);
+        
+        // FIXED: Blind stopService invocation removed. Service lifecycle is now managed by decrementAndCheckStop.
     }
 
     private static void broadcastError(Context context, String message) {
@@ -615,8 +627,7 @@ public class FileReceiver implements Runnable {
         intent.putExtra(Constants.EXTRA_ERROR_MESSAGE, message);
         LocalBroadcastManager.getInstance(context).sendBroadcast(intent);
 
-        Intent stopIntent = new Intent(context, FileTransferForegroundService.class);
-        context.stopService(stopIntent);
+        // FIXED: Blind stopService invocation removed. Service lifecycle is now managed by decrementAndCheckStop.
     }
 
     private static void notifyError(final String error) {
