@@ -485,7 +485,6 @@ public class FileReceiver implements Runnable {
                 break;
             case "jpg":
             case "jpeg":
-            case "png":
                 subFolder = "images";
                 break;
             case "mp4":
